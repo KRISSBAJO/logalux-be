@@ -230,6 +230,10 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 		       (bk.status in ('requested','confirmed') and bk.starts_at > now()) as can_cancel,
 		       (bk.status in ('completed','paid') and not exists (select 1 from reviews rv where rv.booking_id = bk.id)) as can_review,
 		       (select rv.id from reviews rv where rv.booking_id = bk.id limit 1) as review_id,
+		       (bk.status in ('paid','completed') and bk.starts_at > now() - interval '30 days') as can_tip,
+		       (select coalesce(sum(l.amount_cents),0) from ledger l where l.booking_id = bk.id and l.kind = 'tip')::int as tip_cents,
+		       (bk.starts_at < now() and bk.starts_at > now() - interval '14 days' and bk.status not like 'cancelled%' and not exists (select 1 from disputes d where d.booking_id = bk.id)) as can_report,
+		       (select json_build_object('ref', d.ref, 'status', d.status, 'outcome', d.outcome, 'outcome_cents', d.outcome_cents, 'decision_note', d.decision_note) from disputes d where d.booking_id = bk.id order by d.created_at desc limit 1) as problem,
 		       (select coalesce(json_agg(sm.id order by sm.sort, sm.created_at), '[]') from site_media sm join reviews rv on rv.id::text = sm.ref where sm.slot='review' and rv.booking_id = bk.id) as review_photos
 		from bookings bk join businesses b on b.id = bk.business_id join staff st on st.id = bk.staff_id left join locations l on l.id = bk.location_id
 		where bk.user_id = $1 order by bk.starts_at desc limit 60`, c.ID)
@@ -238,7 +242,7 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	orders, _ := rows(ctx, s.pool, `
-		select o.id, o.status, o.fulfilment, o.total_cents, o.discount_cents, o.gift_cents, o.created_at,
+		select o.id, o.status, o.fulfilment, o.total_cents, o.discount_cents, o.gift_cents, o.credit_cents, o.currency, o.created_at,
 		       (select string_agg(oi.qty || ' × ' || oi.name, ', ') from order_items oi where oi.order_id = o.id) as items,
 		       (select coalesce(json_agg(json_build_object('seller', sh.seller_name, 'fulfilment', sh.fulfilment, 'status', sh.status, 'tracking', sh.tracking) order by sh.seller_name), '[]') from order_shipments sh where sh.order_id = o.id) as shipments,
 		       (select p.url from payments p where p.order_id = o.id and p.status = 'pending' order by p.created_at desc limit 1) as pay_url

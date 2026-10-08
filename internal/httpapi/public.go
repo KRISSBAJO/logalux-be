@@ -485,6 +485,7 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		businessID      *string
 	}
 	bySeller := map[string]*sellerTotal{}
+	currency := "" // every item must be priced in the same one
 	for _, it := range req.Items {
 		if it.Qty <= 0 {
 			it.Qty = 1
@@ -497,6 +498,16 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		err := tx.QueryRow(ctx, `select id, seller_name, name, price_cents, shipping_cents, stock, sizes, shipping, pickup and business_id is not null, business_id::text from products where slug=$1 and active for update`, it.ProductSlug).Scan(&pid, &seller, &name, &price, &shipCents, &stock, &sizes, &ships, &collects, &bizID)
 		if err != nil {
 			writeErr(w, 400, "unknown product "+it.ProductSlug)
+			return
+		}
+		itemCurrency := "USD"
+		if bizID != nil {
+			_ = tx.QueryRow(ctx, `select currency from businesses where id=$1`, *bizID).Scan(&itemCurrency)
+		}
+		if currency == "" {
+			currency = itemCurrency
+		} else if currency != itemCurrency {
+			writeErr(w, 400, "this order mixes items priced in dollars and in naira; place one order for each")
 			return
 		}
 		unit := int(price)
@@ -544,13 +555,25 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		lines = append(lines, line{pid, seller, name, it.SizeLabel, it.Qty, unit})
 	}
 	// Discounts are worked out here. Nothing the browser says about an amount is trusted.
-	promoID, discount, why := promoDiscount(ctx, tx, req.PromoCode, "orders", "USD", subtotal, true, "")
+	market := map[string]string{"NGN": "NG"}[currency]
+	if market == "" {
+		market = "US"
+	}
+	promoID, discount, why := promoDiscount(ctx, tx, req.PromoCode, "orders", currency, subtotal, true, "")
 	if why != "" {
 		writeErr(w, 400, why)
 		return
 	}
-	tax := ((subtotal-discount)*925 + 5000) / 10000 // 9.25% retail sales tax, Tennessee default
+	sellerItems, sellerBiz := map[string]int{}, map[string]*string{}
+	for seller, t := range bySeller {
+		sellerItems[seller], sellerBiz[seller] = t.items, t.businessID
+	}
+	tax := orderTax(ctx, tx, sellerItems, sellerBiz, subtotal, discount, stateOf(req.Address))
 	total := subtotal - discount + shipping + tax
+	if currency != "USD" && strings.TrimSpace(req.GiftCode) != "" {
+		writeErr(w, 400, "gift cards are in US dollars and cannot pay for an order in naira")
+		return
+	}
 	giftID, balance, why := giftBalance(ctx, tx, req.GiftCode, "USD", true)
 	if why != "" {
 		writeErr(w, 400, why)
@@ -564,12 +587,17 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	// Referral credit is spent before any card is asked for.
 	credit := 0
 	buyer := s.customerID(r)
-	if buyer != nil && total > 0 {
+	if buyer != nil && total > 0 && currency == "USD" { // store credit is in dollars
 		_, _ = tx.Exec(ctx, `select 1 from users where id=$1 for update`, *buyer) // one order at a time may spend it
 		if credit = creditBalance(ctx, tx, *buyer); credit > total {
 			credit = total
 		}
 		total -= credit
+	}
+	// The cart asks what an order would come to before placing it. Nothing is kept: the transaction is rolled back.
+	if strings.HasSuffix(r.URL.Path, "/quote") {
+		writeJSON(w, 200, M{"quote": M{"subtotal_cents": subtotal, "discount_cents": discount, "shipping_cents": shipping, "tax_cents": tax, "gift_cents": gift, "credit_cents": credit, "total_cents": total, "currency": currency}})
+		return
 	}
 	promoCode, giftMask := "", ""
 	if promoID != "" {
@@ -581,7 +609,11 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	var orderID string
 	if err := tx.QueryRow(ctx, `insert into orders (customer_name, customer_phone, status, fulfilment, subtotal_cents, shipping_cents, tax_cents, total_cents, address, promo_code, discount_cents, gift_code, gift_cents)
-		values ($1,$2,$13,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning id`, req.CustomerName, req.CustomerPhone, req.Fulfilment, subtotal, shipping, tax, total, req.Address, promoCode, discount, giftMask, gift, map[bool]string{true: "pending", false: "paid"}[total > 0 && s.payMode("US") == "live"]).Scan(&orderID); err != nil {
+		values ($1,$2,$13,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning id`, req.CustomerName, req.CustomerPhone, req.Fulfilment, subtotal, shipping, tax, total, req.Address, promoCode, discount, giftMask, gift, map[bool]string{true: "pending", false: "paid"}[total > 0 && s.payMode(market) == "live"]).Scan(&orderID); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if _, err := tx.Exec(ctx, `update orders set currency=$2 where id=$1`, orderID, currency); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -634,18 +666,18 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_, _ = tx.Exec(ctx, `update orders set customer_email=$2 where id=$1`, orderID, strings.TrimSpace(req.CustomerEmail))
-	_, _ = tx.Exec(ctx, `insert into payment_events (provider, kind, order_id, amount_cents, currency, status, reference) values ($1,'order',$2,$3,'USD',$4,$5)`,
-		s.payMode("US"), orderID, total, map[bool]string{true: "simulated", false: "pending"}[s.payMode("US") == "simulation"], "sim_"+orderID[:8])
+	_, _ = tx.Exec(ctx, `insert into payment_events (provider, kind, order_id, amount_cents, currency, status, reference) values ($1,'order',$2,$3,$6,$4,$5)`,
+		s.payMode(market), orderID, total, map[bool]string{true: "simulated", false: "pending"}[s.payMode(market) == "simulation"], "sim_"+orderID[:8], currency)
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if total > 0 && s.payMode("US") == "live" {
+	if total > 0 && s.payMode(market) == "live" {
 		email := strings.TrimSpace(req.CustomerEmail)
 		if uid := s.customerID(r); uid != nil && email == "" {
 			_ = s.pool.QueryRow(ctx, `select email from users where id=$1`, *uid).Scan(&email)
 		}
-		if _, _, err := s.startPayment(ctx, payStart{Provider: "stripe", Purpose: "order", OrderID: orderID, Amount: total, Currency: "USD", Email: email, Description: "LogaLuxe shop order"}); err != nil {
+		if _, _, err := s.startPayment(ctx, payStart{Provider: providerFor(market), Purpose: "order", OrderID: orderID, Amount: total, Currency: currency, Email: email, Description: "LogaLuxe shop order"}); err != nil {
 			_, _ = s.pool.Exec(ctx, `update orders set status='cancelled' where id=$1`, orderID)
 			s.unwindOrder(ctx, orderID)
 			writeErr(w, 502, "the payment page could not be opened, so the order was not placed; please try again")
@@ -671,8 +703,21 @@ func (s *Server) getOrderByID(w http.ResponseWriter, r *http.Request, id string,
 	delete(o, "user_id")
 	items, _ := rows(ctx, s.pool, `select oi.seller_name, oi.name, oi.size_label, oi.qty, oi.unit_cents, coalesce(p.slug, '') as product_slug from order_items oi left join products p on p.id = oi.product_id where oi.order_id=$1`, id)
 	o["items"] = items
-	shipments, _ := rows(ctx, s.pool, `select seller_name, fulfilment, status, items_cents, shipping_cents, tracking, updated_at from order_shipments where order_id=$1 order by seller_name`, id)
+	shipments, _ := rows(ctx, s.pool, `select sh.id, sh.seller_name, sh.fulfilment, sh.status, sh.items_cents, sh.shipping_cents, sh.tracking, sh.updated_at,
+		(select json_build_object('status', rt.status, 'reason', rt.reason, 'reply', rt.reply, 'refund_cents', rt.refund_cents, 'credit_cents', rt.credit_cents, 'created_at', rt.created_at, 'decided_at', rt.decided_at) from order_returns rt where rt.shipment_id = sh.id) as return
+		from order_shipments sh where sh.order_id=$1 order by sh.seller_name`, id)
+	for _, sh := range shipments {
+		ok, until, why := s.returnWindow(ctx, fmt.Sprint(sh["id"]))
+		sh["can_return"] = ok && sh["return"] == nil
+		if ok {
+			sh["return_until"] = until
+		} else {
+			sh["return_why"] = why
+		}
+		delete(sh, "id")
+	}
 	o["shipments"] = shipments
+	o["return_reasons"] = returnReasons
 	if pay, err := row(ctx, s.pool, `select reference, url, amount_cents, currency, expires_at from payments where order_id=$1 and status='pending' order by created_at desc limit 1`, id); err == nil {
 		o["payment"] = pay
 	}

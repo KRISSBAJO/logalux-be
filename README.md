@@ -177,6 +177,20 @@ Each of these was drawn in the design and now has real data behind it (`c_extras
 - Not built: order updates on WhatsApp.
 - Test: `node scripts/e2e/customer-extras.js`.
 
+### After the sale, setup, and the naira shop
+
+Migrations 0023 to 0025; `c_care.go`, `m_onboarding.go`, `order_mail.go`.
+
+- **Tax.** Each business charges its own rate (`businesses.sales_tax_bp`) on what it sells. Brand products are sold by LogaLuxe and taxed by the state they ship to, from `tax_rates` (`GET /v1/admin/tax-rates`, `PUT|DELETE /v1/admin/tax-rates/{region}`); a state not listed is not taxed. `POST /v1/orders/quote` takes the same body as an order, changes nothing, and answers the totals: the cart shows those and never works tax out itself.
+- **Returns.** `POST /v1/auth/orders/{id}/returns` `{seller, reason, note}` while the seller's stated window is open (`can_return`, `return_until`, `return_why` on each part of `GET /v1/orders/{id}`). The seller answers at `GET /v1/m/returns`, `POST /v1/m/returns/{id}` `{action, reply, refund_cents, restock}`; staff answer for brand products at `/v1/admin/returns`. A refund goes to the card as far as a card paid and the rest as store credit; the seller's balance is debited and the marketplace fee on the refunded items is returned.
+- **A problem with a visit.** `POST /v1/auth/bookings/{id}/problem` within 14 days opens a dispute. The business answers within 48 hours at `GET /v1/m/problems`, `POST /v1/m/problems/{id}`; staff then decide in the console's disputes queue.
+- **A tip after the visit.** `POST /v1/auth/bookings/{id}/tip` `{amount_cents}`, up to 30 days after, at most the price of the visit.
+- **Gift cards bought online.** `POST /v1/gift-cards/buy`, US dollars, $10 to $500. The code is emailed to the recipient (or the buyer) and never returned to the browser.
+- **Order emails.** The customer is emailed when an order is placed, ready or shipped, and when a return is answered; each seller is emailed about a new order and a return request.
+- **Getting a business ready.** `GET /v1/m/onboarding` lists seven setup steps, each worked out from what is really there. Identity papers: `POST /v1/m/verification/documents` (photo or PDF, 10 MB, stored privately), `POST /v1/m/verification/submit`. Staff read them at `GET /v1/admin/verification/{id}/documents` and `GET /v1/admin/verification-documents/{id}`; every view is in the audit log.
+- **The shop in naira.** A product is priced in its seller's currency (brands in dollars). `GET /v1/products?currency=NGN` lists the naira shop; an order is in one currency and is paid through that market's provider. Dollar gift cards and store credit cannot pay for a naira order.
+- Tests: `node scripts/e2e/customer-care.js`, `node scripts/e2e/setup-and-naira.js`.
+
 ### Launch safety
 
 - **Customers confirm their email.** Sign-up emails a link to `/verify?token=` (48 hours). `POST /v1/auth/verify` `{token}` confirms the address the link was sent to; `POST /v1/auth/verify/send` sends it again, at most every two minutes. `user.email_verified` is in every account answer. Reviews of a business or a product need a confirmed email. Using a password reset link also confirms it.

@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -48,7 +50,8 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminVerification(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	out, err := rows(r.Context(), s.pool, `
-		select v.id, v.status, v.risk_score, v.id_type, v.id_provider, v.licence_status, v.portfolio_note, v.decision_note, v.decided_by, v.decided_at, v.created_at,
+		select v.id, v.status, v.risk_score, v.id_type, v.id_provider, v.licence_status, v.portfolio_note, v.decision_note, v.decided_by, v.decided_at, v.created_at, v.submitted_at,
+		       (select count(*) from verification_documents vd where vd.business_id = v.business_id) as documents,
 		       extract(epoch from now()-v.created_at)/3600 as age_hours,
 		       b.id as business_id, b.slug, b.name, b.owner_name, b.category, b.market, b.phone, b.instagram, b.tone,
 		       l.address, l.city
@@ -104,6 +107,19 @@ func (s *Server) adminVerificationDecide(w http.ResponseWriter, r *http.Request)
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	setup := strings.TrimRight(s.cfg.WebURL, "/") + "/business/setup"
+	note := ""
+	if strings.TrimSpace(req.Note) != "" {
+		note = "\n\n\"" + strings.TrimSpace(req.Note) + "\""
+	}
+	switch status {
+	case "approved":
+		s.notifyBusiness(fmt.Sprint(before["business_id"]), "verification_email", "You are verified on LogaLuxe", "We have checked your details and your page is now live. Clients can find and book you."+note+"\n\n"+setup)
+	case "needs_info":
+		s.notifyBusiness(fmt.Sprint(before["business_id"]), "verification_email", "We need a little more to verify you", "We looked at what you sent and need something more before your page can go live."+note+"\n\nAdd it here: "+setup+"#verify")
+	case "rejected":
+		s.notifyBusiness(fmt.Sprint(before["business_id"]), "verification_email", "About your LogaLuxe verification", "We could not verify your business with what you sent, so your page is not live."+note+"\n\nYou can send new documents here: "+setup+"#verify")
 	}
 	s.audit(r, "verification."+req.Decision, id, before, M{"status": status, "note": req.Note})
 	writeJSON(w, 200, M{"ok": true, "status": status})

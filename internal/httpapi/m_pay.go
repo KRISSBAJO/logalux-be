@@ -236,6 +236,10 @@ func (s *Server) settlePayment(ctx context.Context, ref string) M {
 		_, _ = s.pool.Exec(ctx, `update orders set status='paid' where id=$1 and status='pending'`, p["order_id"])
 		s.settleOrder(ctx, fmt.Sprint(p["order_id"]))
 		_, _ = s.pool.Exec(ctx, `insert into payment_events (provider, kind, order_id, amount_cents, currency, status, reference) values ($1,'order',$2,$3,$4,'paid',$5)`, p["provider"], p["order_id"], amount, p["currency"], ref)
+	case p["purpose"] == "gift":
+		s.giftPaid(ctx, id, ref)
+	case p["purpose"] == "tip":
+		s.recordTip(ctx, fmt.Sprint(p["booking_id"]), amount, "card", "pending")
 	case p["purpose"] == "sale":
 		s.runPaidSale(ctx, id)
 		s.rememberCard(ctx, id) // when the sale was a membership, so next month can be charged

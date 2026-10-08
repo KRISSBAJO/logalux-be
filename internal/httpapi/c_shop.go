@@ -46,7 +46,8 @@ func (s *Server) listProducts(w http.ResponseWriter, r *http.Request) {
 		and ($3 = '' or p.seller_name = $3 or b.slug = $3 or ($3 = 'booked' and b.slug = any($7::text[])) or ($3 = 'brands' and p.business_id is null))
 		and ($4 = '' or lower($4) = any(p.tags))
 		and ($5 = 0 or least(p.price_cents, coalesce((select min((z->>'price_cents')::int) from jsonb_array_elements(p.sizes) z), p.price_cents)) >= $5) and ($6 = 0 or least(p.price_cents, coalesce((select min((z->>'price_cents')::int) from jsonb_array_elements(p.sizes) z), p.price_cents)) <= $6)
-		and ($8 = '' or ($8 = 'pickup' and p.pickup and p.business_id is not null) or ($8 = 'ship' and p.shipping))`
+		and ($8 = '' or ($8 = 'pickup' and p.pickup and p.business_id is not null) or ($8 = 'ship' and p.shipping))
+		and coalesce(b.currency, 'USD') = $9`
 	booked := []string{}
 	if uid := s.customerID(r); uid != nil {
 		rs, _ := rows(ctx, s.pool, `select distinct b.slug from bookings bk join businesses b on b.id = bk.business_id where bk.user_id=$1`, *uid)
@@ -54,9 +55,13 @@ func (s *Server) listProducts(w http.ResponseWriter, r *http.Request) {
 			booked = append(booked, fmt.Sprint(x["slug"]))
 		}
 	}
-	args := []any{strings.TrimSpace(q.Get("q")), q.Get("category"), q.Get("seller"), strings.TrimSpace(q.Get("tag")), atoi("min"), atoi("max"), booked, q.Get("delivery")}
+	shopCurrency := "USD" // the shop shows one currency at a time: dollars unless naira is asked for
+	if strings.EqualFold(q.Get("currency"), "NGN") {
+		shopCurrency = "NGN"
+	}
+	args := []any{strings.TrimSpace(q.Get("q")), q.Get("category"), q.Get("seller"), strings.TrimSpace(q.Get("tag")), atoi("min"), atoi("max"), booked, q.Get("delivery"), shopCurrency}
 	out, err := rows(ctx, s.pool, `select p.id, p.slug, p.name, p.seller_name, b.slug as business_slug, (b.verification_status = 'verified') as seller_verified, p.category, p.description, p.price_cents, p.compare_cents,
-		p.stock, p.tone, p.tags, p.rating::float8 as rating, p.review_count, p.sold, p.pickup and p.business_id is not null as pickup, p.shipping, p.shipping_cents, p.sizes,
+		p.stock, p.tone, p.tags, p.rating::float8 as rating, p.review_count, p.sold, p.pickup and p.business_id is not null as pickup, p.shipping, p.shipping_cents, p.sizes, coalesce(b.currency, 'USD') as currency,
 		(select sm.id from site_media sm where sm.slot='product' and sm.ref = p.slug and sm.active order by sm.sort, sm.created_at desc limit 1) as photo_id,
 		count(*) over() as total
 		from products p left join businesses b on b.id = p.business_id where `+where+` order by (p.stock > 0) desc, `+order+` limit `+strconv.Itoa(per)+` offset `+strconv.Itoa((page-1)*per), args...)
@@ -70,11 +75,11 @@ func (s *Server) listProducts(w http.ResponseWriter, r *http.Request) {
 		delete(p, "total")
 	}
 	// What can be chosen, counted across the whole shop so a filter never shows a dead end it created itself.
-	categories, _ := rows(ctx, s.pool, `select p.category, count(*) as n from products p where p.active and p.kind in ('retail','both') group by 1 order by 2 desc, 1`)
+	categories, _ := rows(ctx, s.pool, `select p.category, count(*) as n from products p left join businesses b on b.id = p.business_id where p.active and p.kind in ('retail','both') and coalesce(b.currency, 'USD') = $1 group by 1 order by 2 desc, 1`, shopCurrency)
 	sellers, _ := rows(ctx, s.pool, `select p.seller_name, b.slug as business_slug, (b.verification_status = 'verified') as verified, count(*) as n from products p left join businesses b on b.id = p.business_id
-		where p.active and p.kind in ('retail','both') group by 1,2,3 order by 4 desc, 1`)
-	tags, _ := rows(ctx, s.pool, `select t as tag, count(*) as n from products p, unnest(p.tags) t where p.active and p.kind in ('retail','both') group by 1 order by 2 desc, 1 limit 24`)
-	writeJSON(w, 200, M{"products": out, "total": total, "page": page, "per_page": per, "categories": categories, "sellers": sellers, "tags": tags, "booked": booked})
+		where p.active and p.kind in ('retail','both') and coalesce(b.currency, 'USD') = $1 group by 1,2,3 order by 4 desc, 1`, shopCurrency)
+	tags, _ := rows(ctx, s.pool, `select t as tag, count(*) as n from products p left join businesses b on b.id = p.business_id, unnest(p.tags) t where p.active and p.kind in ('retail','both') and coalesce(b.currency, 'USD') = $1 group by 1 order by 2 desc, 1 limit 24`, shopCurrency)
+	writeJSON(w, 200, M{"products": out, "total": total, "page": page, "per_page": per, "categories": categories, "sellers": sellers, "tags": tags, "booked": booked, "currency": shopCurrency})
 }
 
 // GET /v1/products/{slug}
@@ -82,7 +87,7 @@ func (s *Server) getProduct(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	p, err := row(ctx, s.pool, `select p.id, p.slug, p.name, p.seller_name, p.category, p.description, p.how_to_use, p.price_cents, p.compare_cents, p.stock, p.sizes, p.tone, p.tags,
 		p.rating::float8 as rating, p.review_count, p.sold, p.pickup and p.business_id is not null as pickup, p.shipping, p.shipping_cents,
-		b.slug as business_slug, b.name as business, (b.verification_status = 'verified') as seller_verified, b.currency as business_currency,
+		b.slug as business_slug, b.name as business, (b.verification_status = 'verified') as seller_verified, b.currency as business_currency, coalesce(b.currency, 'USD') as currency,
 		(select l.city from locations l where l.business_id = b.id and l.is_primary) as business_city,
 		(select min(sv.price_cents) from services sv where sv.business_id = b.id and sv.online and not sv.archived and sv.category <> 'Add-ons') as business_from_cents,
 		(select coalesce(json_agg(json_build_object('service_id', sp.service_id, 'name', sv.name) order by sv.name), '[]') from service_products sp join services sv on sv.id = sp.service_id where sp.product_id = p.id and not sv.archived) as used_in
@@ -94,7 +99,8 @@ func (s *Server) getProduct(w http.ResponseWriter, r *http.Request) {
 	photos, _ := rows(ctx, s.pool, `select id, alt from site_media where slot='product' and ref=$1 and active order by sort, created_at desc limit 6`, p["slug"])
 	related, _ := rows(ctx, s.pool, `select p.slug, p.name, p.seller_name, p.price_cents, p.tone, p.rating::float8 as rating,
 		(select sm.id from site_media sm where sm.slot='product' and sm.ref = p.slug and sm.active order by sm.sort limit 1) as photo_id
-		from products p where p.active and p.kind in ('retail','both') and p.slug <> $1 order by (p.seller_name = $3) desc, (p.category = $2) desc, p.sold desc limit 4`, p["slug"], p["category"], p["seller_name"])
+		from products p left join businesses rb on rb.id = p.business_id where p.active and p.kind in ('retail','both') and p.slug <> $1 and coalesce(rb.currency, 'USD') = $4
+		order by (p.seller_name = $3) desc, (p.category = $2) desc, p.sold desc limit 4`, p["slug"], p["category"], p["seller_name"], p["currency"])
 	reviews, _ := rows(ctx, s.pool, `select id, author_name, rating, body, verified, created_at from product_reviews where product_id=$1 order by created_at desc limit 30`, p["id"])
 	can := M{"review": false, "why": "Sign in to write a review."}
 	if uid := s.customerID(r); uid != nil {

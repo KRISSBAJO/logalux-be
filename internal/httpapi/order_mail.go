@@ -14,7 +14,7 @@ func (s *Server) mailOrder(orderID, subject string, body func(o M, lines string)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		o, err := row(ctx, s.pool, `select id::text as id, customer_name, customer_email, total_cents, credit_cents, gift_cents from orders where id=$1`, orderID)
+		o, err := row(ctx, s.pool, `select id::text as id, customer_name, customer_email, total_cents, credit_cents, gift_cents, currency from orders where id=$1`, orderID)
 		if err != nil {
 			return
 		}
@@ -29,7 +29,7 @@ func (s *Server) mailOrder(orderID, subject string, body func(o M, lines string)
 			if fmt.Sprint(it["size_label"]) != "" {
 				size = " (" + fmt.Sprint(it["size_label"]) + ")"
 			}
-			sb.WriteString(fmt.Sprintf("  %v x %v%s, from %v: %s\n", it["qty"], it["name"], size, it["seller_name"], formatMoney(int(toInt(it["unit_cents"])*toInt(it["qty"])), "USD")))
+			sb.WriteString(fmt.Sprintf("  %v x %v%s, from %v: %s\n", it["qty"], it["name"], size, it["seller_name"], formatMoney(int(toInt(it["unit_cents"])*toInt(it["qty"])), fmt.Sprint(o["currency"]))))
 		}
 		if _, err := s.mail.Send(ctx, to, subject, body(o, sb.String())); err != nil {
 			s.logMailFailure("order email", to, err)
@@ -54,7 +54,7 @@ func (s *Server) orderPlaced(orderID string) {
 				how.WriteString("  " + fmt.Sprint(p["seller_name"]) + ": shipped to you. We email you when it is on its way.\n")
 			}
 		}
-		paid := "You paid " + formatMoney(int(toInt(o["total_cents"])), "USD") + "."
+		paid := "You paid " + formatMoney(int(toInt(o["total_cents"])), fmt.Sprint(o["currency"])) + "."
 		if toInt(o["total_cents"]) == 0 {
 			paid = "Nothing was charged."
 		}
