@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"logaluxe/api/internal/geo"
 	"net/http"
 	"regexp"
 	"strings"
@@ -99,14 +100,22 @@ type businessReq struct {
 	Timezone   string   `json:"timezone"`
 	Tone       string   `json:"tone"`
 	Highlights []string `json:"highlights"`
-	// Used only when creating: the first location.
-	Address string `json:"address"`
-	City    string `json:"city"`
-	Region  string `json:"region"`
+	// Used only when creating: the country (or "market", its older name) and the first location.
+	Country        string   `json:"country"`
+	Address        string   `json:"address"`
+	City           string   `json:"city"`
+	Region         string   `json:"region"`
+	Lat            *float64 `json:"lat"`
+	Lng            *float64 `json:"lng"`
+	Travels        *bool    `json:"travels"`
+	TravelRadiusKm *int     `json:"travel_radius_km"`
 }
 
 func (b *businessReq) check(creating bool) string {
 	b.Name, b.OwnerName = strings.TrimSpace(b.Name), strings.TrimSpace(b.OwnerName)
+	if creating {
+		b.Market = geo.CleanCountry(firstNonEmpty(b.Country, b.Market))
+	}
 	switch {
 	case len(b.Name) < 2 || len(b.Name) > 80:
 		return "the business name must be 2 to 80 characters"
@@ -125,7 +134,7 @@ func (b *businessReq) check(creating bool) string {
 	}
 	if b.Timezone != "" {
 		if _, err := time.LoadLocation(b.Timezone); err != nil {
-			return "unknown time zone; use a name like America/Chicago or Africa/Lagos"
+			return "unknown time zone; use a name like America/New_York or Africa/Lagos"
 		}
 	}
 	return ""
@@ -150,13 +159,32 @@ func (s *Server) adminBusinessCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "the booking link can use lower-case letters, numbers and dashes")
 		return
 	}
-	currency, country := "USD", "US"
-	if req.Market == "NG" {
-		currency, country = "NGN", "NG"
+	var taken bool
+	_ = s.pool.QueryRow(ctx, `select exists(select 1 from businesses where slug=$1)`, req.Slug).Scan(&taken)
+	if taken {
+		writeErr(w, 409, "that booking link is taken; choose another")
+		return
+	}
+	// The country decides the money; the place decides the time, unless a zone was chosen by hand.
+	currency, country := geo.Currency(req.Market), req.Market
+	_, radius, why := travelRadius(req.TravelRadiusKm)
+	if why != "" {
+		writeErr(w, 400, why)
+		return
+	}
+	loc, why := s.placeLocation(ctx, req.Address, req.City, req.Region, country, req.Lat, req.Lng)
+	if why != "" {
+		writeErr(w, 400, why)
+		return
 	}
 	if req.Timezone == "" {
-		req.Timezone = map[string]string{"US": "America/Chicago", "NG": "Africa/Lagos"}[req.Market]
+		req.Timezone = loc.Timezone
 	}
+	travels := req.Travels != nil && *req.Travels
+	if !travels {
+		radius = nil
+	}
+	req.Phone = localPhone(country, req.Phone)
 	if req.Tone == "" {
 		req.Tone = "#3B1D22"
 	}
@@ -179,16 +207,9 @@ func (s *Server) adminBusinessCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hours := `{"mon":["09:00","18:00"],"tue":["09:00","18:00"],"wed":["09:00","18:00"],"thu":["09:00","18:00"],"fri":["09:00","18:00"],"sat":["09:00","16:00"],"sun":null}`
-	locName := req.City
-	if locName == "" {
-		locName = "Main location"
-	}
-	var lat, lng *float64
-	if la, ln, ok := geocode(ctx, req.Address, req.City, req.Region); ok {
-		lat, lng = &la, &ln
-	}
-	if _, err := tx.Exec(ctx, `insert into locations (business_id, name, address, city, region, country, timezone, is_primary, hours, lat, lng) values ($1,$2,$3,$4,$5,$6,$7,true,$8::jsonb,$9,$10)`,
-		id, locName, req.Address, req.City, req.Region, country, req.Timezone, hours, lat, lng); err != nil {
+	if _, err := tx.Exec(ctx, `insert into locations (business_id, name, address, city, region, country, county, timezone, is_primary, hours, lat, lng, position_source, travels, travel_radius_km)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,true,$9::jsonb,$10,$11,$12,$13,$14)`,
+		id, loc.City, loc.Address, loc.City, loc.Region, country, loc.County, firstNonEmpty(loc.Timezone, req.Timezone), hours, loc.Lat, loc.Lng, loc.Source, travels, radius); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -205,8 +226,8 @@ func (s *Server) adminBusinessCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	s.audit(r, "business.create", id, nil, M{"name": req.Name, "slug": req.Slug, "market": req.Market})
-	writeJSON(w, 201, M{"ok": true, "id": id, "slug": req.Slug})
+	s.audit(r, "business.create", id, nil, M{"name": req.Name, "slug": req.Slug, "market": req.Market, "city": loc.City, "region": loc.Region, "timezone": req.Timezone})
+	writeJSON(w, 201, M{"ok": true, "id": id, "slug": req.Slug, "timezone": req.Timezone, "location": loc, "position": positionWord(loc.Source, false)})
 }
 
 // PUT /v1/admin/businesses/{id}/profile
@@ -238,8 +259,6 @@ func (s *Server) adminBusinessProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	// Bookings are placed in the location's time zone; keep them in step.
-	_, _ = s.pool.Exec(ctx, `update locations set timezone=$2 where business_id=$1`, id, req.Timezone)
 	s.audit(r, "business.profile", id, before, M{"name": req.Name, "category": req.Category, "timezone": req.Timezone})
 	writeJSON(w, 200, M{"ok": true})
 }
@@ -251,10 +270,14 @@ type locationReq struct {
 	Address      string              `json:"address"`
 	City         string              `json:"city"`
 	Region       string              `json:"region"`
+	Country      string              `json:"country"` // must be the business's own; a business trades in one country
 	ArrivalNotes string              `json:"arrival_notes"`
 	Lat          *float64            `json:"lat"` // leave both empty to find the position from the address
 	Lng          *float64            `json:"lng"`
 	Hours        map[string][]string `json:"hours"`
+	// Goes to clients rather than having a shop front, and how far. Left out, both stay as they are; 0 clears the distance.
+	Travels        *bool `json:"travels"`
+	TravelRadiusKm *int  `json:"travel_radius_km"`
 }
 
 // PUT /v1/admin/locations/{id}
@@ -274,39 +297,22 @@ func (s *Server) adminLocationUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, msg)
 		return
 	}
-	if (req.Lat == nil) != (req.Lng == nil) {
-		writeErr(w, 400, "give both latitude and longitude, or neither")
-		return
-	}
-	if req.Lat != nil && (*req.Lat < -90 || *req.Lat > 90 || *req.Lng < -180 || *req.Lng > 180) {
-		writeErr(w, 400, "that map position is not on Earth; latitude is -90 to 90 and longitude -180 to 180")
-		return
-	}
-	var oldAddress, oldCity string
-	var hadPosition bool
-	if err := s.pool.QueryRow(r.Context(), `select address, city, lat is not null from locations where id=$1`, id).Scan(&oldAddress, &oldCity, &hadPosition); err != nil {
+	old, err := s.loadLocation(r.Context(), id, "")
+	if err != nil {
 		writeErr(w, 404, "location not found")
 		return
 	}
-	positioned := "kept"
-	if req.Lat != nil {
-		positioned = "set by hand"
-	} else if !hadPosition || oldAddress != req.Address || oldCity != req.City {
-		// No position given and the address is new or changed: look it up.
-		if lat, lng, ok := geocode(r.Context(), req.Address, req.City, req.Region); ok {
-			req.Lat, req.Lng, positioned = &lat, &lng, "found from the address"
-		} else {
-			positioned = "not found"
-		}
-	}
-	tag, err := s.pool.Exec(r.Context(), `update locations set name=$2, address=$3, city=$4, region=$5, arrival_notes=$6, hours=$7::jsonb, lat=coalesce($8, lat), lng=coalesce($9, lng) where id=$1`,
-		id, strings.TrimSpace(req.Name), req.Address, req.City, req.Region, req.ArrivalNotes, string(hours), req.Lat, req.Lng)
-	if err != nil || tag.RowsAffected() == 0 {
-		writeErr(w, 404, "location not found")
+	loc, positioned, why := s.saveLocation(r.Context(), id, old, &req, string(hours))
+	if why != "" {
+		writeErr(w, 400, why)
 		return
 	}
-	s.audit(r, "location.update", id, nil, M{"name": req.Name, "hours": json.RawMessage(hours), "position": positioned})
-	writeJSON(w, 200, M{"ok": true, "position": positioned})
+	// The older words for what happened to the pin, which the console and its checks know.
+	if positioned == "found" {
+		positioned = "found from the address"
+	}
+	s.audit(r, "location.update", id, nil, M{"name": req.Name, "hours": json.RawMessage(hours), "position": positioned, "timezone": loc.Timezone})
+	writeJSON(w, 200, M{"ok": true, "position": positioned, "location": loc})
 }
 
 // ---------- services ----------

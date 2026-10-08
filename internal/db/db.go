@@ -26,6 +26,9 @@ var seedMerchantSQL string
 //go:embed seed_ops.sql
 var seedOpsSQL string
 
+//go:embed seed_places.sql
+var seedPlacesSQL string
+
 func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
@@ -142,5 +145,24 @@ func SeedMerchant(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("seed merchant: %w", err)
 	}
 	slog.Info("seeded sample history for the merchant screens")
+	return nil
+}
+
+// SeedPlaces adds the sample businesses in other cities (Atlanta, Houston,
+// New York, Los Angeles, Memphis, Abuja, Port Harcourt). It runs once, on a
+// database that holds the sample data and does not have them yet; it changes
+// nothing that was seeded before.
+func SeedPlaces(ctx context.Context, pool *pgxpool.Pool) error {
+	var samples, done bool
+	if err := pool.QueryRow(ctx, `select exists(select 1 from businesses where slug='ada'), exists(select 1 from businesses where slug='peachtree')`).Scan(&samples, &done); err != nil {
+		return err
+	}
+	if !samples || done {
+		return nil
+	}
+	if _, err := pool.Exec(ctx, seedPlacesSQL); err != nil {
+		return fmt.Errorf("seed places: %w", err)
+	}
+	slog.Info("seeded sample businesses in more cities")
 	return nil
 }

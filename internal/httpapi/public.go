@@ -6,89 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
-
-// GET /v1/businesses?q=&category=&market=
-func (s *Server) listBusinesses(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	// A page of results. A city can hold hundreds of businesses, so never send them all as cards.
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 || limit > 60 {
-		limit = 60
-	}
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	if offset < 0 {
-		offset = 0
-	}
-	filters := []any{strings.TrimSpace(q.Get("q")), q.Get("category"), q.Get("market"), strings.TrimSpace(q.Get("where"))}
-	const matches = `b.status='live' and coalesce((b.settings->'booking'->>'on_search')::boolean, true)
-		  and ($1='' or b.name ilike '%'||$1||'%' or b.tagline ilike '%'||$1||'%' or b.category ilike '%'||$1||'%'
-		       or exists (select 1 from services sv where sv.business_id=b.id and sv.online and sv.name ilike '%'||$1||'%'))
-		  and ($2='' or b.category=$2)
-		  and ($3='' or b.market=$3)
-		  and ($4='' or l.city ilike '%'||$4||'%' or l.name ilike '%'||$4||'%' or l.address ilike '%'||$4||'%' or l.region ilike $4)`
-	const fromPrice = `(select min(price_cents) from services sv where sv.business_id=b.id and sv.online and sv.category <> 'Add-ons')`
-	order := map[string]string{"reviews": "b.review_count desc, b.rating desc", "price": "from_cents asc nulls last, b.rating desc"}[q.Get("sort")]
-	if order == "" {
-		// A business that bids for new clients is listed first, and marked as promoted.
-		order = "boost desc, b.rating desc, b.review_count desc"
-	}
-	out, err := rows(r.Context(), s.pool, `
-		select b.id, b.slug, b.name, b.tagline, b.category, b.market, b.currency, b.timezone, b.rating, b.review_count,
-		       b.verification_status, b.tone, b.highlights, (select sm.id from site_media sm where sm.slot='logo' and sm.ref = b.slug and sm.active limit 1) as logo_id,
-		       l.name as area, l.city, l.hours, l.lat, l.lng, count(*) over() as total, `+boostSQL+`::float8 as boost,
-		       (select count(*) from staff st where st.business_id=b.id and st.bookable) as staff_count,
-		       (select min(price_cents) from services sv where sv.business_id=b.id and sv.online and sv.category <> 'Add-ons') as from_cents,
-		       -- The first few services, so a result can show real prices without opening the page.
-		       coalesce((select jsonb_agg(x) from (select sv.name, sv.price_cents, sv.duration_min from services sv
-		         where sv.business_id=b.id and sv.online and sv.category <> 'Add-ons'
-		         order by ($1 <> '' and sv.name ilike '%'||$1||'%') desc, sv.sort, sv.name limit 3) x), '[]'::jsonb) as services
-		from businesses b
-		left join locations l on l.business_id=b.id and l.is_primary
-		where `+matches+`
-		order by `+order+`, b.name
-		limit `+strconv.Itoa(limit)+` offset `+strconv.Itoa(offset), filters...)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	total := 0
-	var seen, promoted []string
-	for _, b := range out {
-		if n, ok := b["total"].(int64); ok {
-			total = int(n)
-		}
-		delete(b, "total")
-		boost, _ := b["boost"].(float64)
-		b["promoted"] = boost > 0 && q.Get("sort") == ""
-		delete(b, "boost")
-		seen = append(seen, fmt.Sprint(b["id"]))
-		if boost > 0 && q.Get("sort") == "" {
-			promoted = append(promoted, fmt.Sprint(b["id"]))
-		}
-	}
-	// A sitemap build or another machine reading the list is not a person looking at it.
-	if q.Get("quiet") != "1" {
-		s.countLeadEvents("impression", seen...)
-		s.countLeadEvents("promoted_impression", promoted...)
-	}
-	// Every match as a light map pin, so the map shows the whole city while the list shows one page.
-	pins, _ := rows(r.Context(), s.pool, `
-		select b.slug, b.name, b.rating, b.currency, l.lat, l.lng, `+fromPrice+` as from_cents
-		from businesses b left join locations l on l.business_id=b.id and l.is_primary
-		where `+matches+` and l.lat is not null and l.lng is not null
-		order by b.rating desc, b.review_count desc limit 800`, filters...)
-	if total == 0 && offset > 0 { // a page past the end
-		_ = s.pool.QueryRow(r.Context(), `select count(*) from businesses b left join locations l on l.business_id=b.id and l.is_primary where `+matches, filters...).Scan(&total)
-	}
-	writeJSON(w, 200, M{"businesses": out, "total": total, "pins": pins, "limit": limit, "offset": offset})
-}
 
 // GET /v1/businesses/{slug}
 func (s *Server) getBusiness(w http.ResponseWriter, r *http.Request) {
@@ -106,7 +29,8 @@ func (s *Server) getBusiness(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := biz["id"]
-	locs, _ := rows(ctx, s.pool, `select id, name, address, city, region, country, lat, lng, timezone, is_primary, hours, arrival_notes from locations where business_id=$1 order by is_primary desc`, id)
+	locs, _ := rows(ctx, s.pool, `select id, name, address, city, region, country, lat, lng, timezone, is_primary, hours, arrival_notes, travels, travel_radius_km,
+		case when lat is null then 'none' when travels or position_source = 'city' then 'area' else 'exact' end as pin from locations where business_id=$1 order by is_primary desc`, id)
 	staff, _ := rows(ctx, s.pool, `select id, name, initials, role, level, tone, bookable, rating, (select coalesce(array_agg(ss.service_id::text), '{}') from staff_services ss where ss.staff_id = staff.id) as service_ids from staff where business_id=$1 and bookable and not archived order by role='owner' desc, name`, id)
 	services, _ := rows(ctx, s.pool, `select id, name, category, description, duration_min, processing_min, buffer_min, price_cents, deposit_cents from services where business_id=$1 and online and not archived order by sort, name`, id)
 	reviews, _ := rows(ctx, s.pool, `select id, author_name, service_name, rating, body, reply, pinned, created_at from reviews where business_id=$1 and status='published' order by pinned desc, created_at desc limit 20`, id)

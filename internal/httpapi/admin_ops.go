@@ -69,7 +69,7 @@ func (s *Server) adminBusiness(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "business not found")
 		return
 	}
-	locs, _ := rows(ctx, s.pool, `select id, name, address, city, region, country, timezone, is_primary, hours, arrival_notes, lat, lng from locations where business_id=$1 order by is_primary desc`, id)
+	locs, _ := rows(ctx, s.pool, `select id, name, address, city, region, country, county, timezone, is_primary, hours, arrival_notes, lat, lng, travels, travel_radius_km, position_source from locations where business_id=$1 order by is_primary desc`, id)
 	staff, _ := rows(ctx, s.pool, `select id, name, initials, role, level, tone, bookable, rating from staff where business_id=$1 order by role='owner' desc, name`, id)
 	svcs, _ := rows(ctx, s.pool, `select sv.id, sv.name, sv.category, sv.description, sv.duration_min, sv.processing_min, sv.buffer_min, sv.price_cents, sv.deposit_cents, sv.online, sv.sort,
 		(select coalesce(array_agg(ss.staff_id::text), '{}') from staff_services ss where ss.service_id = sv.id) as staff_ids from services sv where sv.business_id=$1 order by sv.sort, sv.name`, id)

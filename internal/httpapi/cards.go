@@ -104,9 +104,26 @@ func (s *Server) authCardDelete(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 404, "card not found")
 			return
 		}
-		if err := providerJSON(ctx, http.MethodPost, "https://api.stripe.com/v1/payment_methods/"+url.PathEscape(id)+"/detach", s.cfg.StripeSecret, url.Values{}, nil, nil); err != nil {
-			writeErr(w, 502, "the card could not be removed just now; try again")
-			return
+		var list struct {
+			Data []stripeCard `json:"data"`
+		}
+		_ = providerJSON(ctx, http.MethodGet, "https://api.stripe.com/v1/customers/"+url.PathEscape(customer)+"/payment_methods?type=card&limit=50", s.cfg.StripeSecret, nil, nil, &list)
+		same := []string{id}
+		for _, c := range list.Data {
+			if c.ID == id {
+				for _, d := range list.Data {
+					if d.ID != id && d.Card.Brand == c.Card.Brand && d.Card.Last4 == c.Card.Last4 && d.Card.ExpMonth == c.Card.ExpMonth && d.Card.ExpYear == c.Card.ExpYear {
+						same = append(same, d.ID)
+					}
+				}
+			}
+		}
+		for i, pmID := range same {
+			err := providerJSON(ctx, http.MethodPost, "https://api.stripe.com/v1/payment_methods/"+url.PathEscape(pmID)+"/detach", s.cfg.StripeSecret, url.Values{}, nil, nil)
+			if err != nil && i == 0 {
+				writeErr(w, 502, "the card could not be removed just now; try again")
+				return
+			}
 		}
 		writeJSON(w, 200, M{"ok": true})
 		return

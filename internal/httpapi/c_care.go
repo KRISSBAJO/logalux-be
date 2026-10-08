@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"logaluxe/api/internal/geo"
 	"net/http"
 	"strings"
 	"time"
@@ -40,13 +41,21 @@ func orderTax(ctx context.Context, q rowQuerier, items map[string]int, businessO
 	return tax
 }
 
-// stateOf reads a two-letter state from an order's address ("region", or "state").
+// stateOf reads the state of an order's address ("region", or "state") as its two-letter code.
 func stateOf(address M) string {
 	if address == nil {
 		return ""
 	}
 	for _, k := range []string{"region", "state"} {
-		if v := strings.ToUpper(strings.TrimSpace(fmt.Sprint(address[k]))); len(v) == 2 {
+		raw, ok := address[k].(string)
+		if !ok {
+			continue
+		}
+		// "TN", "tn" and "Tennessee" are the same state. A code we do not know is passed on as typed.
+		if code, known := geo.Region("US", raw); known {
+			return code
+		}
+		if v := strings.ToUpper(strings.TrimSpace(raw)); len(v) == 2 {
 			return v
 		}
 	}
@@ -523,10 +532,23 @@ type giftOrder struct {
 	Note           string `json:"note"`
 	BuyerName      string `json:"buyer_name"`
 	BuyerEmail     string `json:"buyer_email"`
+	// Where the person it is for will spend it: US (dollars, the default) or NG (naira).
+	// A card is spent only in its own currency, so this is chosen before the amount.
+	Country string `json:"country"`
+}
+
+// giftCurrency is the money a gift card for a country is in, and the least and most it can hold.
+func giftCurrency(country string) (currency string, min, max int) {
+	if country == "NG" {
+		return "NGN", 500000, 50000000 // 5,000 to 500,000 naira, in kobo
+	}
+	return "USD", 1000, 50000 // 10 to 500 dollars, in cents
 }
 
 // issueBoughtGift makes the card and emails it: the code to the person it is for, a receipt to the buyer.
 func (s *Server) issueBoughtGift(ctx context.Context, g giftOrder, paymentRef string) (string, error) {
+	country := firstNonEmpty(geo.CleanCountry(g.Country), "US")
+	currency, _, _ := giftCurrency(country)
 	var code string
 	for attempt := 0; attempt < 4; attempt++ {
 		c, err := randomCode(3, 4)
@@ -536,7 +558,7 @@ func (s *Server) issueBoughtGift(ctx context.Context, g giftOrder, paymentRef st
 		code = "LX-" + c
 		var id string
 		err = s.pool.QueryRow(ctx, `insert into gift_cards (code, initial_cents, balance_cents, currency, recipient_name, recipient_email, note, issued_by)
-			values ($1,$2,$2,'USD',$3,$4,$5,$6) on conflict (code) do nothing returning id::text`, code, g.AmountCents, g.RecipientName, g.RecipientEmail, g.Note, "bought by "+g.BuyerEmail).Scan(&id)
+			values ($1,$2,$2,$7,$3,$4,$5,$6) on conflict (code) do nothing returning id::text`, code, g.AmountCents, g.RecipientName, g.RecipientEmail, g.Note, "bought by "+g.BuyerEmail, currency).Scan(&id)
 		if err == nil {
 			_, _ = s.pool.Exec(ctx, `insert into gift_card_txns (gift_card_id, amount_cents, note, actor) values ($1,$2,$3,$4)`, id, g.AmountCents, "Bought online"+map[bool]string{true: " · " + paymentRef, false: ""}[paymentRef != ""], g.BuyerName)
 			break
@@ -546,8 +568,9 @@ func (s *Server) issueBoughtGift(ctx context.Context, g giftOrder, paymentRef st
 	if code == "" {
 		return "", fmt.Errorf("could not make a card code")
 	}
-	shop := strings.TrimRight(s.cfg.WebURL, "/") + "/shop"
-	amount := formatMoney(g.AmountCents, "USD")
+	// The link opens the shop of the card's own country, where it can be spent.
+	shop := strings.TrimRight(s.cfg.WebURL, "/") + "/shop?country=" + strings.ToLower(country)
+	amount := formatMoney(g.AmountCents, currency)
 	to := firstNonEmpty(g.RecipientEmail, g.BuyerEmail)
 	note := ""
 	if g.Note != "" {
@@ -576,7 +599,23 @@ func (s *Server) issueBoughtGift(ctx context.Context, g giftOrder, paymentRef st
 	return code, nil
 }
 
-// POST /v1/gift-cards/buy   {amount_cents, recipient_name, recipient_email, note, buyer_name, buyer_email}
+// GET /v1/gift-cards/options
+// What a gift card can be for each country: its currency, the least and most, the amounts to offer, and who takes the payment.
+func (s *Server) giftOptions(w http.ResponseWriter, r *http.Request) {
+	out := []M{}
+	for _, c := range geo.Countries {
+		currency, min, max := giftCurrency(c)
+		amounts := []int{2500, 5000, 10000, 20000}
+		if c == "NG" {
+			amounts = []int{1000000, 2500000, 5000000, 10000000}
+		}
+		out = append(out, M{"country": c, "country_name": geo.CountryName(c), "currency": currency, "min_cents": min, "max_cents": max, "amounts_cents": amounts,
+			"provider": providerFor(c), "payments": s.payMode(c)})
+	}
+	writeJSON(w, 200, M{"options": out})
+}
+
+// POST /v1/gift-cards/buy   {country, amount_cents, recipient_name, recipient_email, note, buyer_name, buyer_email}
 // US dollars, $10 to $500. The code is only ever sent by email, never shown in the browser.
 func (s *Server) giftBuy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -590,9 +629,18 @@ func (s *Server) giftBuy(w http.ResponseWriter, r *http.Request) {
 	if c, ok := s.customerFrom(ctx, bearer(r)); ok {
 		g.BuyerName, g.BuyerEmail = firstNonEmpty(g.BuyerName, strings.TrimSpace(c.FirstName+" "+c.LastName)), firstNonEmpty(g.BuyerEmail, c.Email)
 	}
+	country := geo.CleanCountry(g.Country)
+	if strings.TrimSpace(g.Country) == "" {
+		country = "US"
+	}
+	currency, min, max := giftCurrency(country)
+	g.Country = country
 	switch {
-	case g.AmountCents < 1000 || g.AmountCents > 50000:
-		writeErr(w, 400, "a gift card is between $10 and $500")
+	case country == "":
+		writeErr(w, 400, "choose whether the card is for someone in the United States or in Nigeria")
+		return
+	case g.AmountCents < min || g.AmountCents > max:
+		writeErr(w, 400, "a gift card for "+geo.InCountry(country)+" is between "+formatMoney(min, currency)+" and "+formatMoney(max, currency))
 		return
 	case !mail.Valid(g.BuyerEmail):
 		writeErr(w, 400, "add your email, for the receipt")
@@ -605,21 +653,22 @@ func (s *Server) giftBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sentTo := firstNonEmpty(g.RecipientEmail, g.BuyerEmail)
-	if s.payMode("US") != "live" {
+	// The card is paid for in its own currency, through that country's provider, whoever is buying it.
+	if s.payMode(country) != "live" {
 		if _, err := s.issueBoughtGift(ctx, g, ""); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		writeJSON(w, 201, M{"ok": true, "sent_to": sentTo})
+		writeJSON(w, 201, M{"ok": true, "sent_to": sentTo, "country": country, "currency": currency})
 		return
 	}
 	payload, _ := json.Marshal(g)
-	ref, link, err := s.startPayment(ctx, payStart{Provider: "stripe", Purpose: "gift", Payload: payload, Amount: g.AmountCents, Currency: "USD", Email: g.BuyerEmail, Description: "LogaLuxe gift card"})
+	ref, link, err := s.startPayment(ctx, payStart{Provider: providerFor(country), Purpose: "gift", Payload: payload, Amount: g.AmountCents, Currency: currency, Email: g.BuyerEmail, Description: "LogaLuxe gift card"})
 	if err != nil {
 		writeErr(w, 502, "the payment page could not be opened; nothing was charged, please try again")
 		return
 	}
-	writeJSON(w, 201, M{"ok": true, "sent_to": sentTo, "payment": M{"url": link, "reference": ref}})
+	writeJSON(w, 201, M{"ok": true, "sent_to": sentTo, "country": country, "currency": currency, "payment": M{"url": link, "reference": ref, "provider": providerFor(country), "currency": currency}})
 }
 
 // giftPaid runs when a gift card's payment arrives.

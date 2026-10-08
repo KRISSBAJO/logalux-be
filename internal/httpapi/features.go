@@ -91,8 +91,9 @@ func (s *Server) features(w http.ResponseWriter, r *http.Request) {
 	for _, f := range featureList {
 		out[f.Key] = s.featureOn(f.Key)
 	}
+	texts := s.featureOn("sms_messages")
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, M{"features": out})
+	writeJSON(w, 200, M{"features": out, "texts_in": M{"US": texts && s.smsReady("US"), "NG": texts && s.smsReady("NG")}})
 }
 
 // GET /v1/admin/features

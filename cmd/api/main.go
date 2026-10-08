@@ -45,6 +45,15 @@ func main() {
 			slog.Error("seed ops", "err", err)
 			os.Exit(1)
 		}
+		if err := db.SeedPlaces(ctx, pool); err != nil {
+			slog.Error("seed places", "err", err)
+			os.Exit(1)
+		}
+	}
+	// Existing locations get their state in its stored form and the time zone of where they are. Once.
+	if err := httpapi.BackfillGeo(ctx, pool); err != nil {
+		slog.Error("places", "err", err)
+		os.Exit(1)
 	}
 	if cfg.Seed {
 		if err := httpapi.BootstrapMerchants(ctx, pool, cfg); err != nil {

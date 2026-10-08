@@ -36,6 +36,8 @@ type Customer struct {
 	PhoneVerified bool `json:"phone_verified"`
 	// How they want to hear about bookings: whatsapp, sms or email.
 	Channel string `json:"preferred_channel"`
+	// False for an account made with a phone alone; it can set one under its details.
+	HasPassword bool `json:"has_password"`
 }
 
 func bearer(r *http.Request) string {
@@ -49,9 +51,9 @@ func (s *Server) customerFrom(ctx context.Context, token string) (Customer, bool
 	if token == "" {
 		return c, false
 	}
-	err := s.pool.QueryRow(ctx, `select u.id::text, coalesce(u.email,''), u.first_name, u.last_name, coalesce(u.phone,''), u.email_verified_at is not null, u.phone_verified_at is not null, u.preferred_channel
+	err := s.pool.QueryRow(ctx, `select u.id::text, coalesce(u.email,''), u.first_name, u.last_name, coalesce(u.phone,''), u.email_verified_at is not null, u.phone_verified_at is not null, u.preferred_channel, u.password_hash is not null
 		from user_sessions s join users u on u.id = s.user_id where s.token_hash = $1 and s.expires_at > now()`, hashToken(token)).
-		Scan(&c.ID, &c.Email, &c.FirstName, &c.LastName, &c.Phone, &c.EmailVerified, &c.PhoneVerified, &c.Channel)
+		Scan(&c.ID, &c.Email, &c.FirstName, &c.LastName, &c.Phone, &c.EmailVerified, &c.PhoneVerified, &c.Channel, &c.HasPassword)
 	return c, err == nil
 }
 
@@ -210,6 +212,7 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.pool.Exec(ctx, `update users set failed_logins = 0, locked_until = null, last_login_at = now() where id = $1`, c.ID)
+	c.HasPassword = true
 	writeJSON(w, 200, M{"token": tok, "expires_in": int(userSessionTTL.Seconds()), "user": c})
 }
 
@@ -254,12 +257,14 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, M{"user": c, "bookings": bookings, "orders": orders})
 }
 
-// PUT /v1/auth/me   {first_name, last_name, phone}
+// PUT /v1/auth/me   {first_name, last_name, phone, email}
+// email is taken only from an account that has none yet (one made with a phone alone); it is then confirmed by the usual link.
 func (s *Server) authUpdate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		FirstName string `json:"first_name"`
 		LastName  string `json:"last_name"`
 		Phone     string `json:"phone"`
+		Email     string `json:"email"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, "invalid json")
@@ -275,10 +280,28 @@ func (s *Server) authUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "that phone number does not look right; include the country code")
 		return
 	}
+	c := currentCustomer(r)
 	if _, err := s.pool.Exec(r.Context(), `update users set first_name=$2, last_name=$3, phone=nullif($4,''),
-		phone_verified_at = case when coalesce(phone,'') = $4 then phone_verified_at end where id=$1`, currentCustomer(r).ID, req.FirstName, req.LastName, phone); err != nil {
+		phone_verified_at = case when coalesce(phone,'') = $4 then phone_verified_at end where id=$1`, c.ID, req.FirstName, req.LastName, phone); err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	if email := strings.ToLower(strings.TrimSpace(req.Email)); email != "" && c.Email == "" {
+		if !mail.Valid(email) {
+			writeErr(w, 400, "that email address does not look right")
+			return
+		}
+		var taken bool
+		_ = s.pool.QueryRow(r.Context(), `select exists(select 1 from users where lower(email) = $1 and id <> $2)`, email, c.ID).Scan(&taken)
+		if taken {
+			writeErr(w, 409, "that email already has an account")
+			return
+		}
+		if _, err := s.pool.Exec(r.Context(), `update users set email=$2, email_verified_at=null where id=$1 and email is null`, c.ID, email); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		s.sendVerifyEmail(r.Context(), c.ID, email, req.FirstName)
 	}
 	writeJSON(w, 200, M{"ok": true})
 }
@@ -298,9 +321,19 @@ func (s *Server) authPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "choose a new password of at least 8 characters")
 		return
 	}
-	id := currentCustomer(r).ID
-	var hash string
-	if err := s.pool.QueryRow(ctx, `select password_hash from users where id=$1`, id).Scan(&hash); err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Current)) != nil {
+	c := currentCustomer(r)
+	id := c.ID
+	var hash *string
+	if err := s.pool.QueryRow(ctx, `select password_hash from users where id=$1`, id).Scan(&hash); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	switch {
+	case hash == nil && c.Email == "":
+		// A password signs in with an email, so the account needs one first.
+		writeErr(w, 400, "add an email address to your details first; the password goes with it")
+		return
+	case hash != nil && bcrypt.CompareHashAndPassword([]byte(*hash), []byte(req.Current)) != nil:
 		writeErr(w, 403, "the current password is wrong")
 		return
 	}

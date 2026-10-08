@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -56,6 +57,11 @@ type Config struct {
 	// Password for the sample business owners (ada@logaluxe.test and so on). Only used with SEED=true.
 	MerchantDemoPassword string
 
+	// The first guess of where a visitor is, from their internet address. See internal/httpapi/geoip.go.
+	GeoIPProvider  string // geojs (the default, no key), ipinfo (needs GEOIP_API_KEY), ipapi (key optional), or off
+	GeoIPKey       string
+	GeoIPTimeoutMS int // how long a lookup may take before the page goes on without it; 1200 when unset
+
 	StripeSecret   string
 	PaystackSecret string
 	// Signs the events Stripe sends to /v1/webhooks/stripe. Paystack signs with its secret key.
@@ -102,10 +108,15 @@ func Load() (Config, error) {
 		WebAPIKey:            os.Getenv("WEB_API_KEY"),
 		PublicAPIURL:         os.Getenv("API_PUBLIC_URL"),
 		MerchantDemoPassword: os.Getenv("MERCHANT_DEMO_PASSWORD"),
+		GeoIPProvider:        os.Getenv("GEOIP_PROVIDER"),
+		GeoIPKey:             os.Getenv("GEOIP_API_KEY"),
 		StripeSecret:         os.Getenv("STRIPE_SECRET_KEY"),
 		PaystackSecret:       os.Getenv("PAYSTACK_SECRET_KEY"),
 		StripeWebhookSecret:  os.Getenv("STRIPE_WEBHOOK_SECRET"),
 		FlutterwaveSecret:    os.Getenv("FLUTTERWAVE_SECRET_KEY"),
+	}
+	if n, err := strconv.Atoi(os.Getenv("GEOIP_TIMEOUT_MS")); err == nil && n > 0 && n <= 5000 {
+		c.GeoIPTimeoutMS = n
 	}
 	for _, o := range strings.Split(get("CORS_ORIGIN", "http://localhost:3100"), ",") {
 		if o = strings.TrimSpace(o); o != "" {

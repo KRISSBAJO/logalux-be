@@ -90,7 +90,7 @@ func (s *Server) deliver(ctx context.Context, channel, businessName, clientEmail
 		}
 		return status // sent or logged
 	}
-	return "logged" // WhatsApp and SMS are not connected yet
+	return "logged" // a text or a WhatsApp message: the caller sends it when that channel is switched on
 }
 
 // POST /v1/m/inbox/{id}/reply   {body}
@@ -118,10 +118,14 @@ func (s *Server) mThreadReply(w http.ResponseWriter, r *http.Request) {
 		to = *email
 	}
 	delivery := s.deliver(ctx, channel, m.Business, to, body, hasAccount)
-	if channel == "sms" {
+	if channel == "sms" || channel == "whatsapp" {
 		var phone string
 		_ = s.pool.QueryRow(ctx, `select coalesce(c.phone,'') from threads t join clients c on c.id = t.client_id where t.id=$1`, id).Scan(&phone)
-		delivery = s.sendSMS(ctx, m.BusinessID, phone, body+"\n"+m.Business)
+		if channel == "sms" {
+			delivery = s.sendSMS(ctx, m.BusinessID, phone, body+"\n"+m.Business)
+		} else {
+			delivery = s.sendWhatsApp(ctx, phone, body+"\n"+m.Business)
+		}
 	}
 	if _, err := s.pool.Exec(ctx, `insert into thread_messages (thread_id, from_business, author, body, delivery) values ($1,true,$2,$3,$4)`, id, m.Name, body, delivery); err != nil {
 		writeErr(w, 500, err.Error())
@@ -209,10 +213,14 @@ func (s *Server) mThreadCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	delivery := s.deliver(ctx, req.Channel, m.Business, email, body, userID != nil)
-	if req.Channel == "sms" {
+	if req.Channel == "sms" || req.Channel == "whatsapp" {
 		var phone string
 		_ = s.pool.QueryRow(ctx, `select coalesce(phone,'') from clients where id=$1 and business_id=$2`, req.ClientID, m.BusinessID).Scan(&phone)
-		delivery = s.sendSMS(ctx, m.BusinessID, phone, body+"\n"+m.Business)
+		if req.Channel == "sms" {
+			delivery = s.sendSMS(ctx, m.BusinessID, phone, body+"\n"+m.Business)
+		} else {
+			delivery = s.sendWhatsApp(ctx, phone, body+"\n"+m.Business)
+		}
 	}
 	_, _ = s.pool.Exec(ctx, `insert into thread_messages (thread_id, from_business, author, body, delivery) values ($1,true,$2,$3,$4)`, id, m.Name, body, delivery)
 	_, _ = s.pool.Exec(ctx, `update threads set last_preview=$2, last_message_at=now(), status='open', unread_client=unread_client+1 where id=$1`, id, preview(body))

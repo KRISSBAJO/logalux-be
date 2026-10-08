@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"logaluxe/api/internal/config"
+	"logaluxe/api/internal/geo"
 	"logaluxe/api/internal/mail"
 )
 
@@ -163,10 +164,17 @@ func (s *Server) mSignup(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		Business string `json:"business"`
 		Category string `json:"category"`
-		Market   string `json:"market"`
+		Country  string `json:"country"` // US or NG. It decides the currency and the payment provider.
+		Market   string `json:"market"`  // the older name for country; either is read
 		City     string `json:"city"`
-		Region   string `json:"region"`
+		Region   string `json:"region"` // the state: a code or a name
 		Address  string `json:"address"`
+		// A pin the person placed or corrected. Leave both out to find the position from the address.
+		Lat *float64 `json:"lat"`
+		Lng *float64 `json:"lng"`
+		// Goes to clients rather than having a shop front. Left out, an empty street address means it.
+		Travels        *bool `json:"travels"`
+		TravelRadiusKm *int  `json:"travel_radius_km"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, "invalid json")
@@ -174,7 +182,9 @@ func (s *Server) mSignup(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Name, req.Business = strings.TrimSpace(req.Name), strings.TrimSpace(req.Business)
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
-	phone, phoneOK := cleanPhone(req.Phone)
+	country := geo.CleanCountry(firstNonEmpty(req.Country, req.Market))
+	phone, phoneOK := cleanPhone(localPhone(country, req.Phone))
+	_, radius, radiusWhy := travelRadius(req.TravelRadiusKm)
 	switch {
 	case req.Name == "" || len(req.Name) > 80:
 		writeErr(w, 400, "tell us your name")
@@ -194,19 +204,33 @@ func (s *Server) mSignup(w http.ResponseWriter, r *http.Request) {
 	case !businessCategories[req.Category]:
 		writeErr(w, 400, "choose a category")
 		return
-	case req.Market != "US" && req.Market != "NG":
+	case country == "":
 		writeErr(w, 400, "choose the United States or Nigeria")
 		return
+	case radiusWhy != "":
+		writeErr(w, 400, radiusWhy)
+		return
+	}
+	// Where it is: the state in its stored form, the pin, and the time zone of that spot.
+	loc, why := s.placeLocation(ctx, req.Address, req.City, req.Region, country, req.Lat, req.Lng)
+	if why != "" {
+		writeErr(w, 400, why)
+		return
+	}
+	travels := loc.Address == ""
+	if req.Travels != nil {
+		travels = *req.Travels
+	}
+	if !travels {
+		radius = nil
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	currency, country, tz := "USD", "US", "America/Chicago"
-	if req.Market == "NG" {
-		currency, country, tz = "NGN", "NG", "Africa/Lagos"
-	}
+	// The country decides the money; the place decides the time.
+	currency, tz := geo.Currency(country), loc.Timezone
 	// A free handle: the name, then name-2, name-3.
 	base := slugify(req.Business)
 	if !slugRe.MatchString(base) {
@@ -221,11 +245,6 @@ func (s *Server) mSignup(w http.ResponseWriter, r *http.Request) {
 		}
 		slug = base + "-" + itoa(i)
 	}
-	var lat, lng *float64
-	if la, ln, ok := geocode(ctx, req.Address, req.City, req.Region); ok {
-		lat, lng = &la, &ln
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -242,14 +261,15 @@ func (s *Server) mSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.QueryRow(ctx, `insert into businesses (slug, name, category, market, currency, timezone, phone, email, status, verification_status, owner_name)
-		values ($1,$2,$3,$4,$5,$6,$7,$8,'pending','unverified',$9) returning id::text`, slug, req.Business, req.Category, req.Market, currency, tz, phone, req.Email, req.Name).Scan(&bizID); err != nil {
+		values ($1,$2,$3,$4,$5,$6,$7,$8,'pending','unverified',$9) returning id::text`, slug, req.Business, req.Category, country, currency, tz, phone, req.Email, req.Name).Scan(&bizID); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	locName := firstNonEmpty(req.City, "Main location")
+	locName := firstNonEmpty(loc.City, "Main location")
 	hours := `{"mon":["09:00","18:00"],"tue":["09:00","18:00"],"wed":["09:00","18:00"],"thu":["09:00","18:00"],"fri":["09:00","18:00"],"sat":["09:00","16:00"],"sun":null}`
-	if _, err := tx.Exec(ctx, `insert into locations (business_id, name, address, city, region, country, timezone, is_primary, hours, lat, lng) values ($1,$2,$3,$4,$5,$6,$7,true,$8::jsonb,$9,$10)`,
-		bizID, locName, req.Address, req.City, req.Region, country, tz, hours, lat, lng); err != nil {
+	if _, err := tx.Exec(ctx, `insert into locations (business_id, name, address, city, region, country, county, timezone, is_primary, hours, lat, lng, position_source, travels, travel_radius_km)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,true,$9::jsonb,$10,$11,$12,$13,$14)`,
+		bizID, locName, loc.Address, loc.City, loc.Region, country, loc.County, tz, hours, loc.Lat, loc.Lng, loc.Source, travels, radius); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -275,8 +295,9 @@ func (s *Server) mSignup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "the account was created, but we could not sign you in; try signing in")
 		return
 	}
-	_, _ = s.pool.Exec(ctx, `insert into audit_log (actor, action, target, after) values ($1, 'merchant.signup', $2, $3)`, req.Email, bizID, M{"business": req.Business, "market": req.Market})
-	writeJSON(w, 201, M{"token": tok, "expires_in": int(merchantSessionTTL.Seconds()), "slug": slug})
+	_, _ = s.pool.Exec(ctx, `insert into audit_log (actor, action, target, after) values ($1, 'merchant.signup', $2, $3)`, req.Email, bizID, M{"business": req.Business, "market": country, "city": loc.City, "region": loc.Region, "timezone": tz})
+	writeJSON(w, 201, M{"token": tok, "expires_in": int(merchantSessionTTL.Seconds()), "slug": slug, "country": country, "currency": currency, "timezone": tz,
+		"location": loc, "position": positionWord(loc.Source, false), "travels": travels, "place": newPlace(loc.City, loc.Region, country, deref(loc.Lat), deref(loc.Lng))})
 }
 
 // POST /v1/m/login   {email, password}

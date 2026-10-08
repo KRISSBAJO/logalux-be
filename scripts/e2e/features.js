@@ -61,6 +61,17 @@ const NEW = "+1615555" + rnd(), OLD = "+1615555" + rnd(), EMAIL = `e2e-f-${stamp
       r = await call("POST", "/auth/code/send", { phone: NEW }); code = await codeFor(NEW);
       r = await call("POST", "/auth/code/verify", { phone: NEW, code }); check("the same number signs in again without a name", r.status === 200 && r.json.new === false && r.json.user.first_name === "E2E", r.text);
 
+      // An account made with a phone alone adds an email and a password, so it can always sign in.
+      const EMAIL2 = `e2e-f2-${stamp}@example.test`, PASS2 = "e2e-" + stamp + "-second";
+      r = await call("POST", "/auth/password", { new: PASS2 }, T1); check("a password needs an email first", r.status === 400, r.text);
+      r = await call("PUT", "/auth/me", { first_name: "E2E", last_name: "Coder", phone: NEW, email: EMAIL2 }, T1); check("the account adds an email", r.status === 200, r.text);
+      r = await call("GET", "/auth/me?brief=1", undefined, T1); check("the email is on the account, unconfirmed, with no password yet", r.json.user.email === EMAIL2 && r.json.user.email_verified === false && r.json.user.has_password === false, r.text);
+      r = await call("PUT", "/auth/me", { first_name: "E2E", last_name: "Coder", phone: NEW, email: "other-" + EMAIL2 }, T1);
+      r = await call("GET", "/auth/me?brief=1", undefined, T1); check("the email cannot be swapped the same way", r.json.user.email === EMAIL2, r.text);
+      r = await call("POST", "/auth/password", { new: PASS2 }, T1); check("a first password is set without a current one", r.status === 200, r.text);
+      r = await call("POST", "/auth/password", { new: PASS2 + "x" }, T1); check("after that the current password is asked for", r.status === 403, r.text);
+      r = await call("POST", "/auth/login", { email: EMAIL2, password: PASS2 }); check("the account now signs in with email and password too", r.status === 200 && r.json.user.has_password === true && r.json.user.phone === NEW, r.text);
+
       // An account made with a password, whose number was never confirmed.
       r = await call("POST", "/auth/signup", { first_name: "E2E", last_name: "Typed", email: EMAIL, phone: OLD, password: PASS }); const T2 = r.json.token;
       check("a password account is made with a number it has not confirmed", r.status === 201 && r.json.user.phone === OLD, r.text);

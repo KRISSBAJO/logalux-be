@@ -13,6 +13,7 @@ Bash scripts that exercise the running local API with curl. They need Docker, No
 - `node scripts/e2e/payments-live.js` pay links, webhook protection, payout accounts and payouts against the Stripe and Paystack TEST modes. Refuses to run with live keys.
 - `node scripts/e2e/customer-web.js` what the customer web relies on: openings, the month calendar, saved businesses, reviews, moving a booking, shop filters, an order with two sellers and each seller pay and fulfilment, product reviews.
 - `node scripts/e2e/merchant-billing-ai.js` the Pro plan fee and the AI drafts (calls OpenAI twice when the key is set).
+- `node scripts/e2e/geo.js` places, the place picker, a point to a place, search by distance with the widening radius and its notices, by place, by country and by map area, travelling businesses, the first guess from an internet address, gift cards in either country, and a business's country, pin and time zone at sign-up and when its address changes. Needs no payment keys; leaves nothing behind.
 - `merchant-pages.sh` opens every merchant screen and tab as three sample owners.
 - `merchant-smoke.sh` signs in as a sample owner and reads the data for every merchant screen.
 - `merchant-public.sh` the public booking page, a client writing to a business, and the reply. Needs the web app on port 3100. Cleans up after itself.

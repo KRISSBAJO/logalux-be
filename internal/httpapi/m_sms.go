@@ -143,13 +143,13 @@ func providerSend(req *http.Request, what, to string) string {
 // channel is live. It returns the channel used, or "" when nothing was sent.
 func (s *Server) tellPhone(ctx context.Context, businessID, phone, prefer, body string) string {
 	phone = cleanTo(phone)
-	if phone == "" {
+	if phone == "" || prefer == "email" {
 		return ""
 	}
 	if prefer != "sms" && s.whatsappMode() == "live" && s.sendWhatsApp(ctx, phone, body) == "delivered" {
 		return "whatsapp"
 	}
-	if prefer != "email" && s.sendSMS(ctx, businessID, phone, body) == "delivered" {
+	if s.sendSMS(ctx, businessID, phone, body) == "delivered" {
 		return "sms"
 	}
 	return ""

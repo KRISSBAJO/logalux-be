@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"logaluxe/api/internal/geo"
 	"logaluxe/api/internal/mail"
 )
 
@@ -24,7 +25,7 @@ func (s *Server) mSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "business not found")
 		return
 	}
-	locations, _ := rows(ctx, s.pool, `select l.id, l.name, l.address, l.city, l.region, l.timezone, l.is_primary, l.hours, l.arrival_notes, l.lat, l.lng from locations l where l.business_id=$1 order by l.is_primary desc, l.name`, m.BusinessID)
+	locations, _ := rows(ctx, s.pool, `select l.id, l.name, l.address, l.city, l.region, l.country, l.timezone, l.is_primary, l.hours, l.arrival_notes, l.lat, l.lng, l.travels, l.travel_radius_km, l.position_source from locations l where l.business_id=$1 order by l.is_primary desc, l.name`, m.BusinessID)
 	plans, _ := rows(ctx, s.pool, `select distinct on (plan) plan, plan_price_cents, transaction_pct, transaction_fixed_cents, transaction_cap_cents, new_client_pct, marketplace_pct, instant_payout_pct
 		from fees where market=$1 and status='approved' and effective_from <= current_date order by plan, effective_from desc`, m.Market)
 	logins, _ := rows(ctx, s.pool, `select mu.id, mu.email, mu.name, mm.role, mu.last_login_at, st.name as staff from merchant_members mm join merchant_users mu on mu.id = mm.merchant_id left join staff st on st.id = mm.staff_id
@@ -88,7 +89,6 @@ func (s *Server) mSettingsProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	_, _ = s.pool.Exec(r.Context(), `update locations set timezone=$2 where business_id=$1`, m.BusinessID, req.Timezone)
 	_, _ = s.pool.Exec(r.Context(), `update products set seller_name=$2 where business_id=$1`, m.BusinessID, req.Name)
 	writeJSON(w, 200, M{"ok": true})
 }
@@ -176,17 +176,32 @@ func (s *Server) mLocationCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, msg)
 		return
 	}
-	var lat, lng *float64
-	if la, ln, ok := geocode(ctx, req.Address, req.City, req.Region); ok {
-		lat, lng = &la, &ln
+	if c := strings.TrimSpace(req.Country); c != "" && geo.CleanCountry(c) != m.Market {
+		writeErr(w, 400, "a business trades in one country, and this one is in "+geo.InCountry(m.Market))
+		return
+	}
+	_, radius, why := travelRadius(req.TravelRadiusKm)
+	if why != "" {
+		writeErr(w, 400, why)
+		return
+	}
+	loc, why := s.placeLocation(ctx, req.Address, req.City, req.Region, m.Market, req.Lat, req.Lng)
+	if why != "" {
+		writeErr(w, 400, why)
+		return
+	}
+	travels := req.Travels != nil && *req.Travels
+	if !travels {
+		radius = nil
 	}
 	var id string
-	if err := s.pool.QueryRow(ctx, `insert into locations (business_id, name, address, city, region, country, timezone, is_primary, hours, arrival_notes, lat, lng)
-		values ($1,$2,$3,$4,$5,$6,$7,false,$8::jsonb,$9,$10,$11) returning id::text`, m.BusinessID, strings.TrimSpace(req.Name), req.Address, req.City, req.Region, m.Market, m.Timezone, string(hours), req.ArrivalNotes, lat, lng).Scan(&id); err != nil {
+	if err := s.pool.QueryRow(ctx, `insert into locations (business_id, name, address, city, region, country, county, timezone, is_primary, hours, arrival_notes, lat, lng, position_source, travels, travel_radius_km)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,false,$9::jsonb,$10,$11,$12,$13,$14,$15) returning id::text`, m.BusinessID, strings.TrimSpace(req.Name), loc.Address, loc.City, loc.Region, m.Market, loc.County,
+		firstNonEmpty(loc.Timezone, m.Timezone), string(hours), req.ArrivalNotes, loc.Lat, loc.Lng, loc.Source, travels, radius).Scan(&id); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 201, M{"ok": true, "id": id})
+	writeJSON(w, 201, M{"ok": true, "id": id, "position": positionWord(loc.Source, false), "location": loc})
 }
 
 // PUT /v1/m/locations/{id}
@@ -208,26 +223,17 @@ func (s *Server) mLocationUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, msg)
 		return
 	}
-	var oldAddress, oldCity string
-	var had bool
-	if err := s.pool.QueryRow(ctx, `select address, city, lat is not null from locations where id=$1 and business_id=$2`, id, m.BusinessID).Scan(&oldAddress, &oldCity, &had); err != nil {
+	old, err := s.loadLocation(ctx, id, m.BusinessID)
+	if err != nil {
 		writeErr(w, 404, "location not found")
 		return
 	}
-	position := "kept"
-	if !had || oldAddress != req.Address || oldCity != req.City {
-		if la, ln, ok := geocode(ctx, req.Address, req.City, req.Region); ok {
-			req.Lat, req.Lng, position = &la, &ln, "found"
-		} else {
-			position = "not found"
-		}
-	}
-	if _, err := s.pool.Exec(ctx, `update locations set name=$2, address=$3, city=$4, region=$5, arrival_notes=$6, hours=$7::jsonb, lat=coalesce($8, lat), lng=coalesce($9, lng) where id=$1`,
-		id, strings.TrimSpace(req.Name), req.Address, req.City, req.Region, req.ArrivalNotes, string(hours), req.Lat, req.Lng); err != nil {
-		writeErr(w, 500, err.Error())
+	loc, position, why := s.saveLocation(ctx, id, old, &req, string(hours))
+	if why != "" {
+		writeErr(w, 400, why)
 		return
 	}
-	writeJSON(w, 200, M{"ok": true, "position": position})
+	writeJSON(w, 200, M{"ok": true, "position": position, "location": loc})
 }
 
 // POST /v1/m/locations/{id}/action   {action: primary|delete}
@@ -250,6 +256,7 @@ func (s *Server) mLocationAction(w http.ResponseWriter, r *http.Request) {
 	switch req.Action {
 	case "primary":
 		_, _ = s.pool.Exec(ctx, `update locations set is_primary = (id::text = $2) where business_id=$1`, m.BusinessID, id)
+		s.syncBusinessZone(ctx, m.BusinessID) // the business keeps the time of its main location
 	case "delete":
 		if primary {
 			writeErr(w, 409, "make another location the main one before deleting this one")

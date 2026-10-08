@@ -174,7 +174,7 @@ Each of these was drawn in the design and now has real data behind it (`c_extras
 - **Referral credit.** Off until staff set an amount: `GET|PUT /v1/admin/settings/referral` `{credit_cents}` (0 to 10000). A customer's code and link: `GET /v1/auth/referral`. A friend signs up with `ref`, confirms their email and pays for a first visit or has a first order delivered; the worker then credits both once. Credit is in USD and `POST /v1/orders` spends it automatically after the promo code and gift card; an order it covers fully is paid at once. An unpaid order gives it back. LogaLuxe funds it: sellers are paid in full.
 - **Sold counts** are real: units in paid shop orders plus units sold at the desk.
 - **Distance** is worked out in the visitor's browser from their own position and is never sent to the API.
-- Not built: order updates on WhatsApp.
+- Not built: order updates on WhatsApp (confirmations, inbox and campaigns are; see Features).
 - Test: `node scripts/e2e/customer-extras.js`.
 
 ### After the sale, setup, and the naira shop
@@ -209,7 +209,7 @@ Migration 0026; `c_more.go`, `ics.go`.
 - **Customers confirm their email.** Sign-up emails a link to `/verify?token=` (48 hours). `POST /v1/auth/verify` `{token}` confirms the address the link was sent to; `POST /v1/auth/verify/send` sends it again, at most every two minutes. `user.email_verified` is in every account answer. Reviews of a business or a product need a confirmed email. Using a password reset link also confirms it.
 - **Request limits.** One connection may make only so many tries at sign-in, sign-up, reset emails, promo and gift codes, bookings, orders, the waitlist and the help form (`safety.go`); past that the API answers 429 with `Retry-After`. This is on top of the 15 minute lock each account already gets after repeated wrong passwords. Counts are kept in memory per API process. The web app passes the visitor's address in `X-Visitor-IP`; set the same `WEB_API_KEY` on the API and the web app so the API believes it (required in production). `RATE_LIMITS=off` turns the limits off for the end-to-end suites, which make many accounts from one address.
 - **Two-step sign-in for businesses.** `GET /v1/m/security`, `POST /v1/m/2fa/setup`, `/2fa/enable` `{code}` (returns eight recovery codes once), `/2fa/disable` `{password}`. `POST /v1/m/login` then needs `code` and answers `need_code: true` without one. A super admin can reset it for someone who lost their phone: `POST /v1/admin/merchants/reset-2fa` `{email}`. In the web app it is under Settings, Your account.
-- **Search engines.** The web app serves `/robots.txt`, `/sitemap.xml`, a web app manifest, structured data on business, product and listing pages, and a page per city and service (`/nashville`, `/lagos/barbers`). Set `NEXT_PUBLIC_SITE_URL` to the public address. `GET /v1/businesses?quiet=1` lists without counting views, for the sitemap.
+- **Search engines.** The web app serves `/robots.txt`, `/sitemap.xml`, a web app manifest, structured data on business, product and listing pages, and a page per place and service for every place that has businesses (`/nashville-tn`, `/lagos-lagos/barbers`, `/tennessee`, `/nigeria`; the older `/nashville` and `/lagos/...` addresses redirect for good). Set `NEXT_PUBLIC_SITE_URL` to the public address. `GET /v1/businesses?quiet=1` lists without counting views, for the sitemap.
 - Test: `node scripts/e2e/safety.js` with mail logged and the limits on. Every other suite: start the API with `RATE_LIMITS=off` as well.
 
 ### The lead system
@@ -244,7 +244,7 @@ Stripe is used for businesses in the United States and Paystack for businesses i
 - **Promo codes.** A business makes its own codes (`GET|POST /v1/m/promos`, `PUT|DELETE /v1/m/promos/{id}`). They work on its booking page and at its checkout (`promo_code`), and nowhere else.
 - **Statements.** `GET /v1/m/statements` lists the months; `GET /v1/m/statements/{YYYY-MM}` gives opening and closing balance, each total, the payouts and every line, and `?format=csv` downloads it.
 - **Logo.** `POST|DELETE /v1/m/storefront/logo`. It is shown on the public page.
-- **Text messages.** Twilio (United States) and Termii (Nigeria) send reminders, campaign messages and inbox replies on the `sms` channel. Nothing is texted unless `SMS_ENABLED=true` as well as the keys, and the fictional number ranges used by the sample data are never texted.
+- **Text messages.** Twilio texts numbers outside Nigeria and Termii texts Nigerian ones: reminders, campaign messages and inbox replies on the `sms` channel. Nothing is texted unless a super admin has switched **Texts to clients** on at `/admin/features` and the provider keys are set. Numbers in the +1xxx555xxxx and +234803555xxxx ranges are never texted, whatever the switch says.
 
 ### How money moves
 
@@ -255,13 +255,23 @@ A background worker in the API process runs every minute: it settles lines whose
 ### What is simulated
 
 - **Payments in a market without its key.** A payment is recorded as taken and a payout is marked paid with a `sim_` reference. No money moves. Payout accounts added then are labelled simulated and cannot receive a real payout later.
-- **WhatsApp.** No provider is connected: a message on that channel is saved with delivery `logged`. In-app messages are real, email is real when `MAIL_PROVIDER` is set, and texts are real when `SMS_ENABLED=true`.
+- **WhatsApp.** Sent through Twilio (`TWILIO_WHATSAPP_FROM` is the sender Twilio gave you) once a super admin switches **WhatsApp messages** on. Booking confirmations go to the client's phone on the channel they chose, and inbox replies and campaigns on the `whatsapp` channel are delivered. Off, a message on that channel is saved with delivery `logged`. Twilio only allows free-form WhatsApp messages within 24 hours of the client writing in; outside that window it needs approved templates, which are not built.
 - **Plans.** Changing between Free and Pro changes the fees charged. There is no subscription billing.
-- **Membership renewals with live payments.** There is no saved card to charge, so a membership that is due is marked as owing and the desk collects it.
+- **Membership renewals with live payments.** The card used when a membership is bought by pay link is kept by the provider, so the next month can be charged; otherwise a due membership is marked as owing and the desk collects it.
 
 ### Sample owners
 
 With `SEED=true` and `MERCHANT_DEMO_PASSWORD` set, each sample business gets an owner who can sign in at `/business/signin` as `<handle>@logaluxe.test`, for example `ada@logaluxe.test` (United States) or `mnm@logaluxe.test` (Nigeria). Six weeks of sample visits, sales and payouts are loaded once. Leave the password empty in production.
+
+## Places, distance and time zones
+
+Nothing lists cities by hand. The places LogaLuxe serves are wherever live businesses are.
+
+- `GET /v1/places` places with live businesses (`?country=US|NG`, `?category=`, `?lat=&lng=` for nearest first, `?limit=`), with each country's totals and the place to show a stranger (`default`). `GET /v1/places/search?q=` cities, states and countries for a picker, from what is already known; add `lookup=1` to also ask OpenStreetMap Nominatim (only when a person asks for a search, never as they type). `GET /v1/places/{slug}` one place, its nearest neighbours, and `canonical` when the slug is an old form. `GET /v1/places/reverse?lat=&lng=` the place a point is in. `POST /v1/places/locate` where an address lands and its time zone, before saving. `GET /v1/places/states`. `GET /v1/locate` the first guess of where a visitor is, from their internet address.
+- `GET /v1/businesses` also takes `lat`, `lng`, `radius`, `unit`, `widen`, `place` (or `city`, `region`, `country`), `bbox` and `scope` (the country being browsed; `market` is the older name). With a point it lists nearest first inside 25 miles in the United States or 25 kilometres elsewhere, widening to 50, 100 and 250 when fewer than three are close, and says so in `geo.notice`.
+- Nominatim is asked at most once a second from the whole API, with a real User-Agent, and every answer is kept in `geo_cache`. The internet address lookup uses `GEOIP_PROVIDER` (see `.env.example`); only an address prefix is kept, in `geo_ip`, for a week.
+- A location's time zone comes from where it is (`internal/geo/zone.go`): the state, and in the thirteen split states the county when the map gave one, else a longitude line. The business takes its main location's zone. Existing rows were put right once at start-up (`geo_tasks`).
+- Test: `node scripts/e2e/geo.js` (runs with or without payment keys) and `go test ./internal/geo ./internal/httpapi`.
 
 ## Added for the mobile app
 
@@ -274,6 +284,17 @@ With `SEED=true` and `MERCHANT_DEMO_PASSWORD` set, each sample business gets an 
 - A promo code's given-away total counts checkout sales as well as bookings.
 - Changing a business's handle keeps its logo.
 - `CORS_ORIGIN` must include the address the app is served from when it runs in a browser (port 8097 in development).
+
+## Features an admin switches on
+
+Five features are off until a super admin switches them on at `/admin/features` (`GET/PUT /v1/admin/features`). A feature is live only when it is on AND its keys are in the environment; the page names any key still missing. `GET /v1/features` tells the web and the app what to offer, with `texts_in` saying in which countries a text really goes out.
+
+- **Sign in with a texted code** (`sms_login`): `POST /v1/auth/code/send {phone, channel}` and `POST /v1/auth/code/verify {phone, code, first_name?, last_name?, email?, ref?}`. A number nobody has makes an account (409 `need: "name"` asks for a name first); a number on an account that never confirmed it cannot sign in by code alone (409 `need: "password"`). Signed in: `POST /v1/auth/phone/send` and `/auth/phone/verify {code}` confirm the number; `PUT /v1/auth/channel` chooses how to hear about bookings. An account made with a phone alone adds an email through `PUT /v1/auth/me {email}` and a first password through `POST /v1/auth/password {new}` without a current one. Three codes per number in ten minutes, five wrong guesses per code.
+- **Texts to clients** (`sms_messages`) and **WhatsApp messages** (`whatsapp`): above.
+- **Apple Pay and Google Pay** (`wallets`): only a note on the payment explanations; the wallets themselves are switched on in the Stripe dashboard and appear on Stripe's page.
+- **Saved cards** (`saved_cards`): `GET /v1/auth/cards`, `DELETE /v1/auth/cards/{id}`. The three customer payments (`POST /v1/bookings`, `POST /v1/orders`, `POST /v1/auth/bookings/{id}/tip`) take `card_id` to pay at once with a kept card and `save_card` to keep the one about to be used. A charge the bank wants approved falls back to the payment page. Stripe keeps its cards on the customer; for Paystack only the reusable authorisation is stored, never a card number.
+
+Suite: `scripts/e2e/features.js` (codes to 555 numbers are read from the API log).
 
 ## Email
 
