@@ -28,7 +28,7 @@ func (s *Server) mInventory(w http.ResponseWriter, r *http.Request) {
 	if filter == "" {
 		filter = "true"
 	}
-	out, err := rows(ctx, s.pool, `select p.id, p.slug, p.name, p.sku, p.kind, p.category, p.description, p.stock, p.reorder_at, p.cost_cents, p.price_cents, p.active, p.tone, p.supplier_id, su.name as supplier, p.par_level, p.backbar_open::float8 as backbar_open,
+	out, err := rows(ctx, s.pool, `select p.id, p.slug, p.name, p.sku, p.kind, p.category, p.description, p.stock, p.reorder_at, p.cost_cents, p.price_cents, p.active, p.tone, p.supplier_id, su.name as supplier, p.par_level, p.pickup, p.shipping, p.shipping_cents, p.backbar_open::float8 as backbar_open,
 		(select coalesce(json_agg(json_build_object('location_id', ls.location_id, 'name', lo.name, 'qty', ls.qty) order by lo.is_primary desc, lo.name), '[]') from location_stock ls join locations lo on lo.id = ls.location_id where ls.product_id = p.id) as by_location,
 		(select ls.qty from location_stock ls where ls.product_id = p.id and ls.location_id::text = $3) as here,
 		(select sm.id from site_media sm where sm.slot='product' and sm.ref = p.slug and sm.active order by sm.sort, sm.created_at desc limit 1) as photo_id,
@@ -74,6 +74,9 @@ type mProductReq struct {
 	SupplierID  string `json:"supplier_id"`
 	Online      bool   `json:"online"`    // sold in the LogaLuxe shop and on the booking page
 	ParLevel    *int   `json:"par_level"` // a full shelf, for the stock meter; leave out to keep it
+	// Whether the shop may send it, and what sending one order of it costs. Pick-up is always offered. Leave out to keep.
+	Shipping      *bool `json:"shipping"`
+	ShippingCents *int  `json:"shipping_cents"`
 }
 
 func (p *mProductReq) check() string {
@@ -99,6 +102,8 @@ func (p *mProductReq) check() string {
 		return "a back-bar product is not sold to clients, so it cannot be sold online"
 	case len(p.Description) > 2000:
 		return "keep the description under 2,000 characters"
+	case p.ShippingCents != nil && *p.ShippingCents < 0:
+		return "shipping cannot be negative"
 	}
 	return ""
 }
@@ -150,9 +155,9 @@ func (s *Server) mProductCreate(w http.ResponseWriter, r *http.Request) {
 		price = 1 // back-bar items are never sold, but the column needs a positive price
 	}
 	var id string
-	if err := s.pool.QueryRow(ctx, `insert into products (business_id, seller_name, slug, name, description, category, price_cents, stock, sku, cost_cents, reorder_at, kind, supplier_id, active, pickup, shipping, par_level)
-		select $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, (select id from suppliers where id::text = $13 and business_id=$1), $14, true, false, coalesce($15::int, 0) returning id::text`,
-		m.BusinessID, m.Business, slug, req.Name, req.Description, req.Category, price, stock, req.SKU, req.CostCents, req.ReorderAt, req.Kind, supplier, req.Online && req.Kind != "backbar", req.ParLevel).Scan(&id); err != nil {
+	if err := s.pool.QueryRow(ctx, `insert into products (business_id, seller_name, slug, name, description, category, price_cents, stock, sku, cost_cents, reorder_at, kind, supplier_id, active, pickup, shipping, par_level, shipping_cents)
+		select $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, (select id from suppliers where id::text = $13 and business_id=$1), $14, true, coalesce($16::bool, false), coalesce($15::int, 0), coalesce($17::int, 0) returning id::text`,
+		m.BusinessID, m.Business, slug, req.Name, req.Description, req.Category, price, stock, req.SKU, req.CostCents, req.ReorderAt, req.Kind, supplier, req.Online && req.Kind != "backbar", req.ParLevel, req.Shipping, req.ShippingCents).Scan(&id); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -178,9 +183,9 @@ func (s *Server) mProductUpdate(w http.ResponseWriter, r *http.Request) {
 	if price == 0 {
 		price = 1
 	}
-	tag, err := s.pool.Exec(r.Context(), `update products set name=$3, description=$4, category=$5, price_cents=$6, sku=$7, cost_cents=$8, reorder_at=$9, kind=$10, par_level=coalesce($13::int, par_level),
+	tag, err := s.pool.Exec(r.Context(), `update products set name=$3, description=$4, category=$5, price_cents=$6, sku=$7, cost_cents=$8, reorder_at=$9, kind=$10, par_level=coalesce($13::int, par_level), shipping=coalesce($14::bool, shipping), shipping_cents=coalesce($15::int, shipping_cents),
 		supplier_id=(select id from suppliers where id::text = $11 and business_id=$2), active=$12 where id=$1 and business_id=$2`,
-		chi.URLParam(r, "id"), m.BusinessID, req.Name, req.Description, req.Category, price, req.SKU, req.CostCents, req.ReorderAt, req.Kind, req.SupplierID, req.Online && req.Kind != "backbar", req.ParLevel)
+		chi.URLParam(r, "id"), m.BusinessID, req.Name, req.Description, req.Category, price, req.SKU, req.CostCents, req.ReorderAt, req.Kind, req.SupplierID, req.Online && req.Kind != "backbar", req.ParLevel, req.Shipping, req.ShippingCents)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

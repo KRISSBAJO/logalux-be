@@ -44,6 +44,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	})
 
 	r.Route("/v1", func(r chi.Router) {
+		r.Get("/app-return/{screen}", s.appReturn)
 		r.Get("/businesses", s.listBusinesses)
 		r.Get("/businesses/{slug}", s.getBusiness)
 		r.Get("/businesses/{slug}/availability", s.availability)
@@ -190,6 +191,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 				r.Put("/resources/{id}", s.mResourceSave)
 				r.Delete("/resources/{id}", s.mResourceDelete)
 				r.Post("/price-rules", s.mPriceRuleSave)
+				r.Put("/price-rules/order", s.mPriceRuleOrder)
 				r.Put("/price-rules/{id}", s.mPriceRuleSave)
 				r.Delete("/price-rules/{id}", s.mPriceRuleDelete)
 				r.Post("/packages", s.mPackageSave)
@@ -421,6 +423,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 				w.Header().Set("Vary", "Origin")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+				w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 				break
 			}
 		}

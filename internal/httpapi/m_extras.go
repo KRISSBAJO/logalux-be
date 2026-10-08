@@ -87,7 +87,7 @@ func (s *Server) loadPricing(ctx context.Context, businessID string) *pricing {
 	}
 	rules, _ := rows(ctx, s.pool, `select name, coalesce(service_id::text,'') as service_id, days, coalesce(to_char(from_time,'HH24:MI'),'') as from_time, coalesce(to_char(to_time,'HH24:MI'),'') as to_time,
 		level, coalesce(starts_on::text,'') as starts_on, coalesce(ends_on::text,'') as ends_on, adjust_kind, adjust_value
-		from price_rules where business_id=$1 and active order by created_at`, businessID)
+		from price_rules where business_id=$1 and active order by sort, created_at`, businessID)
 	for _, r := range rules {
 		p.rules = append(p.rules, priceRule{Name: fmt.Sprint(r["name"]), ServiceID: fmt.Sprint(r["service_id"]), Level: fmt.Sprint(r["level"]), From: fmt.Sprint(r["from_time"]), To: fmt.Sprint(r["to_time"]),
 			StartsOn: fmt.Sprint(r["starts_on"]), EndsOn: fmt.Sprint(r["ends_on"]), Kind: fmt.Sprint(r["adjust_kind"]), Value: int(toInt(r["adjust_value"])), Days: toStrings(r["days"])})
@@ -98,7 +98,7 @@ func (s *Server) loadPricing(ctx context.Context, businessID string) *pricing {
 var dowKeys = []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
 
 // price returns the price of one service for one person at a local time, and the rules that changed it.
-// A price the person has for themselves replaces the menu price; rules then adjust it in the order they were made.
+// A price the person has for themselves replaces the menu price; rules then adjust it in the order the business put them in.
 func (p *pricing) price(serviceID, staffID string, at time.Time) (int, []string) {
 	price, ok := p.personal[staffID][serviceID]
 	if !ok {
@@ -159,7 +159,7 @@ func (s *Server) mMenu(w http.ResponseWriter, r *http.Request) {
 		from resources re where re.business_id=$1 order by re.name`, m.BusinessID)
 	rules, _ := rows(ctx, s.pool, `select pr.id, pr.name, pr.service_id, sv.name as service, pr.days, to_char(pr.from_time,'HH24:MI') as from_time, to_char(pr.to_time,'HH24:MI') as to_time, pr.level,
 		pr.starts_on, pr.ends_on, pr.adjust_kind, pr.adjust_value, pr.active, pr.created_at
-		from price_rules pr left join services sv on sv.id = pr.service_id where pr.business_id=$1 order by pr.active desc, pr.created_at`, m.BusinessID)
+		from price_rules pr left join services sv on sv.id = pr.service_id where pr.business_id=$1 order by pr.sort, pr.created_at`, m.BusinessID)
 	packages, _ := rows(ctx, s.pool, `select p.id, p.name, p.description, p.price_cents, p.valid_days, p.active, p.created_at,
 		(select coalesce(json_agg(json_build_object('service_id', pi.service_id, 'name', sv.name, 'qty', pi.qty, 'price_cents', sv.price_cents) order by sv.sort, sv.name), '[]') from package_items pi join services sv on sv.id = pi.service_id where pi.package_id = p.id) as items,
 		(select count(*) from client_plans cp where cp.package_id = p.id) as sold,
@@ -395,7 +395,7 @@ func (s *Server) mPriceRuleSave(w http.ResponseWriter, r *http.Request) {
 	args := []any{m.BusinessID, req.Name, req.ServiceID, req.Days, req.From, req.To, req.Level, req.StartsOn, req.EndsOn, req.Kind, req.Value, active}
 	var err error
 	if id == "" {
-		err = s.pool.QueryRow(ctx, `insert into price_rules (business_id, name, service_id, days, from_time, to_time, level, starts_on, ends_on, adjust_kind, adjust_value, active) values ($1, `+vals+`) returning id::text`, args...).Scan(&id)
+		err = s.pool.QueryRow(ctx, `insert into price_rules (business_id, name, service_id, days, from_time, to_time, level, starts_on, ends_on, adjust_kind, adjust_value, active, sort) values ($1, `+vals+`, (select coalesce(max(sort),0)+1 from price_rules where business_id=$1)) returning id::text`, args...).Scan(&id)
 	} else {
 		err = s.pool.QueryRow(ctx, `update price_rules set (name, service_id, days, from_time, to_time, level, starts_on, ends_on, adjust_kind, adjust_value, active) = (`+vals+`) where business_id=$1 and id=$13 returning id::text`, append(args, id)...).Scan(&id)
 	}
@@ -404,6 +404,35 @@ func (s *Server) mPriceRuleSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, M{"ok": true, "id": id})
+}
+
+// PUT /v1/m/price-rules/order   {ids: [...]}   the order the rules are applied in, first to last
+func (s *Server) mPriceRuleOrder(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := readJSON(r, &req); err != nil || len(req.IDs) == 0 || len(req.IDs) > 200 {
+		writeErr(w, 400, "send the rules in the order you want them")
+		return
+	}
+	ctx := r.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+	for i, id := range req.IDs {
+		if _, err := tx.Exec(ctx, `update price_rules set sort=$3 where id::text=$1 and business_id=$2`, id, mc(r).BusinessID, i+1); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, M{"ok": true})
 }
 
 func (s *Server) mPriceRuleDelete(w http.ResponseWriter, r *http.Request) {

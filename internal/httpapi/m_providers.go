@@ -107,7 +107,7 @@ func (s *Server) paystackBanks(ctx context.Context) [][2]string {
 // stripeOnboard creates a Stripe Express account (once) and returns a link to
 // Stripe's own pages, where the business enters its bank and identity details.
 // LogaLuxe never sees them.
-func (s *Server) stripeOnboard(ctx context.Context, existingAccount, email, businessName string) (accountID, link string, err error) {
+func (s *Server) stripeOnboard(ctx context.Context, existingAccount, email, businessName, back string) (accountID, link string, err error) {
 	accountID = existingAccount
 	if accountID == "" {
 		var acct struct {
@@ -120,7 +120,9 @@ func (s *Server) stripeOnboard(ctx context.Context, existingAccount, email, busi
 		}
 		accountID = acct.ID
 	}
-	back := strings.TrimRight(s.cfg.WebURL, "/") + "/business/money/payout-account"
+	if back == "" {
+		back = strings.TrimRight(s.cfg.WebURL, "/") + "/business/money/payout-account"
+	}
 	var l struct {
 		URL string `json:"url"`
 	}

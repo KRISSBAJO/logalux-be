@@ -272,18 +272,88 @@ func (s *Server) mPromoCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, M{"ok": true, "id": id})
 }
 
-// PUT /v1/m/promos/{id}   {active}        DELETE /v1/m/promos/{id}   only a code nobody has used
+// PUT /v1/m/promos/{id}   any of {active, description, min_cents, max_uses, no_limit, starts_at, ends_at, kind, value}
+// The code itself never changes. The discount (kind, value) can change only while nobody has used the code.
+// DELETE /v1/m/promos/{id}   only a code nobody has used
 func (s *Server) mPromoUpdate(w http.ResponseWriter, r *http.Request) {
+	m := mc(r)
 	var req struct {
-		Active bool `json:"active"`
+		Active      *bool   `json:"active"`
+		Description *string `json:"description"`
+		MinCents    *int    `json:"min_cents"`
+		MaxUses     *int    `json:"max_uses"`
+		NoLimit     bool    `json:"no_limit"`  // take the limit on uses away
+		StartsAt    *string `json:"starts_at"` // "" takes the date away
+		EndsAt      *string `json:"ends_at"`
+		Kind        *string `json:"kind"`
+		Value       *int    `json:"value"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, "invalid json")
 		return
 	}
-	tag, err := s.pool.Exec(r.Context(), `update promo_codes set active=$3 where id=$1 and business_id=$2`, chi.URLParam(r, "id"), mc(r).BusinessID, req.Active)
-	if err != nil || tag.RowsAffected() == 0 {
+	ctx := r.Context()
+	id := chi.URLParam(r, "id")
+	var kind string
+	var value, used int
+	var starts, ends *time.Time
+	if err := s.pool.QueryRow(ctx, `select kind, value, used, starts_at, ends_at from promo_codes where id::text=$1 and business_id=$2`, id, m.BusinessID).Scan(&kind, &value, &used, &starts, &ends); err != nil {
 		writeErr(w, 404, "code not found")
+		return
+	}
+	day := func(v *string, end bool, was *time.Time) (*time.Time, bool) {
+		if v == nil {
+			return was, true
+		}
+		if *v == "" {
+			return nil, true
+		}
+		t, err := time.ParseInLocation("2006-01-02", *v, m.Loc)
+		if err != nil {
+			return nil, false
+		}
+		if end {
+			t = t.Add(24*time.Hour - time.Second)
+		}
+		return &t, true
+	}
+	newStarts, ok1 := day(req.StartsAt, false, starts)
+	newEnds, ok2 := day(req.EndsAt, true, ends)
+	changesDiscount := (req.Kind != nil && *req.Kind != kind) || (req.Value != nil && *req.Value != value)
+	if req.Kind != nil {
+		kind = *req.Kind
+	}
+	if req.Value != nil {
+		value = *req.Value
+	}
+	switch {
+	case changesDiscount && used > 0:
+		writeErr(w, 409, "this code has been used, so its discount cannot change; switch it off and make a new one")
+		return
+	case kind != "percent" && kind != "fixed":
+		writeErr(w, 400, "choose a percentage or a fixed amount")
+		return
+	case value <= 0 || (kind == "percent" && value > 100):
+		writeErr(w, 400, "the discount must be more than zero, and a percentage at most 100")
+		return
+	case (req.MinCents != nil && *req.MinCents < 0) || (req.MaxUses != nil && *req.MaxUses < 1):
+		writeErr(w, 400, "the minimum spend and the number of uses cannot be negative")
+		return
+	case req.MaxUses != nil && *req.MaxUses < used:
+		writeErr(w, 400, "the code has already been used "+itoa(used)+" times; the limit cannot be lower than that")
+		return
+	case !ok1 || !ok2 || (newStarts != nil && newEnds != nil && newEnds.Before(*newStarts)):
+		writeErr(w, 400, "check the first and last day")
+		return
+	}
+	if req.Description != nil {
+		d := strings.TrimSpace(*req.Description)
+		req.Description = &d
+	}
+	if _, err := s.pool.Exec(ctx, `update promo_codes set active = coalesce($3, active), description = coalesce($4, description), min_cents = coalesce($5, min_cents),
+		max_uses = case when $7 then null else coalesce($6, max_uses) end, starts_at = $8, ends_at = $9, kind = $10, value = $11 where id::text=$1 and business_id=$2`,
+		id, m.BusinessID, req.Active, req.Description, req.MinCents, req.MaxUses, req.NoLimit, newStarts, newEnds, kind, value); err != nil {
+		writeErr(w, 500, err.Error())
 		return
 	}
 	writeJSON(w, 200, M{"ok": true})

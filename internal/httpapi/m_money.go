@@ -349,12 +349,18 @@ func (s *Server) mPayoutStripe(w http.ResponseWriter, r *http.Request) {
 		BankName    string `json:"bank_name"`
 		Last4       string `json:"last4"`
 		AccountName string `json:"account_name"`
+		ReturnTo    string `json:"return_to"` // "app": come back into the phone app when Stripe is done
 	}
 	_ = readJSON(r, &req)
 	if s.cfg.StripeSecret != "" {
+		back := ""
+		if req.ReturnTo == "app" {
+			// Stripe only returns to a web address, so it returns to the API, which hands over to the app.
+			back = strings.TrimRight(firstNonEmpty(s.cfg.PublicAPIURL, "http://"+r.Host), "/") + "/v1/app-return/payouts"
+		}
 		var rowID, external string
 		_ = s.pool.QueryRow(ctx, `select id::text, external_id from payout_accounts where business_id=$1 and provider='stripe' order by created_at desc limit 1`, m.BusinessID).Scan(&rowID, &external)
-		accountID, link, err := s.stripeOnboard(ctx, external, m.Email, m.Business)
+		accountID, link, err := s.stripeOnboard(ctx, external, m.Email, m.Business, back)
 		if err != nil {
 			writeErr(w, 502, "Stripe could not start the setup: "+err.Error())
 			return
