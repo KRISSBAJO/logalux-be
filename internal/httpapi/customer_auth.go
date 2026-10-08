@@ -229,7 +229,7 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 		       (select string_agg(name, ', ') from booking_items where booking_id = bk.id) as services,
 		       (bk.status in ('requested','confirmed') and bk.starts_at > now()) as can_cancel,
 		       (bk.status in ('completed','paid') and not exists (select 1 from reviews rv where rv.booking_id = bk.id)) as can_review,
-		       (select rv.id from reviews rv where rv.booking_id = bk.id limit 1) as review_id,
+		       (select rv.id from reviews rv where rv.booking_id = bk.id limit 1) as review_id, bk.guest_name, bk.series_id,
 		       (bk.status in ('paid','completed') and bk.starts_at > now() - interval '30 days') as can_tip,
 		       (select coalesce(sum(l.amount_cents),0) from ledger l where l.booking_id = bk.id and l.kind = 'tip')::int as tip_cents,
 		       (bk.starts_at < now() and bk.starts_at > now() - interval '14 days' and bk.status not like 'cancelled%' and not exists (select 1 from disputes d where d.booking_id = bk.id)) as can_report,

@@ -51,6 +51,7 @@ type Config struct {
 	WebURL       string // public address of the website, for links in emails
 	RateLimits   bool   // per-connection limits on sign-in, sign-up, codes, bookings and orders; RATE_LIMITS=off turns them off for test runs
 	WebAPIKey    string // shared with the web app, so the API believes the visitor address it passes on
+	PublicAPIURL string // the API's own public address, for links other services fetch (calendar subscriptions)
 
 	// Password for the sample business owners (ada@logaluxe.test and so on). Only used with SEED=true.
 	MerchantDemoPassword string
@@ -99,6 +100,7 @@ func Load() (Config, error) {
 		WebURL:               get("WEB_URL", "http://localhost:3100"),
 		RateLimits:           strings.ToLower(os.Getenv("RATE_LIMITS")) != "off",
 		WebAPIKey:            os.Getenv("WEB_API_KEY"),
+		PublicAPIURL:         os.Getenv("API_PUBLIC_URL"),
 		MerchantDemoPassword: os.Getenv("MERCHANT_DEMO_PASSWORD"),
 		StripeSecret:         os.Getenv("STRIPE_SECRET_KEY"),
 		PaystackSecret:       os.Getenv("PAYSTACK_SECRET_KEY"),

@@ -34,7 +34,7 @@ func parseLocal(v string, loc *time.Location) (time.Time, bool) {
 }
 
 const bookingCols = `bk.id, bk.status, bk.starts_at, bk.ends_at, bk.client_id, bk.client_name, bk.client_phone, bk.staff_id, bk.source, bk.notes,
-	bk.total_cents, bk.discount_cents, bk.deposit_cents, bk.deposit_paid, bk.tip_cents, bk.paid_at, bk.checked_in_at, bk.promo_code,
+	bk.total_cents, bk.discount_cents, bk.deposit_cents, bk.deposit_paid, bk.tip_cents, bk.paid_at, bk.checked_in_at, bk.promo_code, bk.guest_name, bk.series_id,
 	st.name as staff, st.initials as staff_initials, st.tone as staff_tone,
 	(select string_agg(name, ' + ') from booking_items where booking_id = bk.id) as services`
 
@@ -105,7 +105,7 @@ func (s *Server) mBookingSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := rows(r.Context(), s.pool, `select `+bookingCols+` from bookings bk join staff st on st.id = bk.staff_id
-		where bk.business_id=$1 and (bk.client_name ilike '%' || $2 || '%' or replace(bk.client_phone,' ','') like '%' || replace($2,' ','') || '%')
+		where bk.business_id=$1 and (bk.client_name ilike '%' || $2 || '%' or bk.guest_name ilike '%' || $2 || '%' or replace(bk.client_phone,' ','') like '%' || replace($2,' ','') || '%')
 		order by (bk.starts_at >= now() - interval '3 hours') desc, abs(extract(epoch from (bk.starts_at - now()))) limit 25`, m.BusinessID, q)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -272,7 +272,8 @@ func (s *Server) mBooking(w http.ResponseWriter, r *http.Request) {
 			history["notes"], history["tags"] = c["notes"], c["tags"]
 		}
 	}
-	writeJSON(w, 200, M{"booking": b, "items": items, "client": history})
+	answers, _ := rows(ctx, s.pool, `select label, kind, answer from booking_answers where booking_id=$1 order by sort`, id)
+	writeJSON(w, 200, M{"booking": b, "items": items, "client": history, "answers": answers})
 }
 
 // POST /v1/m/bookings/{id}/action

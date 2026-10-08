@@ -191,6 +191,19 @@ Migrations 0023 to 0025; `c_care.go`, `m_onboarding.go`, `order_mail.go`.
 - **The shop in naira.** A product is priced in its seller's currency (brands in dollars). `GET /v1/products?currency=NGN` lists the naira shop; an order is in one currency and is paid through that market's provider. Dollar gift cards and store credit cannot pay for a naira order.
 - Tests: `node scripts/e2e/customer-care.js`, `node scripts/e2e/setup-and-naira.js`.
 
+### Experience extras
+
+Migration 0026; `c_more.go`, `ics.go`.
+
+- **Booking for someone else.** `POST /v1/bookings` takes `guest_name`; the contact stays the person who booked. Bookings carry it everywhere.
+- **Questions at booking.** A business keeps up to 20 (`GET|POST /v1/m/intake`, `PUT|DELETE /v1/m/intake/{id}`): a short answer, yes or no, a choice, or a box that must be ticked, for every booking or one service. `GET /v1/businesses/{slug}` returns them as `intake`; `POST /v1/bookings` takes `answers` and refuses with a sentence naming the question. The wording is stored with each answer.
+- **Repeat appointments.** `POST /v1/auth/bookings/{id}/repeat` `{every_weeks, times}` books the same visit at the same clock time, each through the normal rules, and answers what was made and what was skipped and why. The bookings share a `series_id`.
+- **Calendar sync, per person.** Out: `POST /v1/m/calendar-sync/feed` gives a private address (`GET /v1/cal/{token}.ics`) that Google, Apple and Outlook calendars subscribe to; set `API_PUBLIC_URL` so the address is one they can reach. In: `PUT /v1/m/calendar-sync/import` `{url}` takes the private iCal address of the person's own calendar, read every ten minutes; their busy times become blocks that cannot be booked. Only times are kept. Daily and weekly repeats are understood; other rules are counted and reported, never guessed. The address must be https on the public internet.
+- **A person's own day.** `GET /v1/m/my-day?date=`: their visits in order with the guest, answers, notes and visit count, and their blocks.
+- **A booking must be free.** `POST /v1/bookings` now refuses a time the person has blocked off or is on approved time off, not only a time another booking holds.
+- **Embedding.** `/embed/{slug}` is the booking page made for an iframe and `/embed.js` adds a "Book now" button to a business's own site. Those bookings use `source: "link"`.
+- Tests: `node scripts/e2e/experience.js`, and `go test ./internal/httpapi -run TestParseICS`.
+
 ### Launch safety
 
 - **Customers confirm their email.** Sign-up emails a link to `/verify?token=` (48 hours). `POST /v1/auth/verify` `{token}` confirms the address the link was sent to; `POST /v1/auth/verify/send` sends it again, at most every two minutes. `user.email_verified` is in every account answer. Reviews of a business or a product need a confirmed email. Using a password reset link also confirms it.

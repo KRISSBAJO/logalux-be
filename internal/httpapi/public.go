@@ -135,7 +135,7 @@ func (s *Server) getBusiness(w http.ResponseWriter, r *http.Request) {
 	}
 	var photoCount int
 	_ = s.pool.QueryRow(ctx, `select count(*) from site_media where slot='business' and ref=$1 and active`, slug).Scan(&photoCount)
-	writeJSON(w, 200, M{"business": biz, "locations": locs, "staff": staff, "services": services, "reviews": reviews, "products": products, "display": display, "policy": policy, "saved": saved, "photo_count": photoCount, "extras": s.bizExtras(ctx, fmt.Sprint(id))})
+	writeJSON(w, 200, M{"business": biz, "locations": locs, "staff": staff, "services": services, "reviews": reviews, "products": products, "display": display, "policy": policy, "saved": saved, "photo_count": photoCount, "extras": s.bizExtras(ctx, fmt.Sprint(id)), "intake": s.intakeFor(ctx, fmt.Sprint(id), nil)})
 }
 
 // GET /v1/businesses/{slug}/availability?date=2026-10-10&services=id,id&staff=id|any
@@ -179,16 +179,18 @@ func (s *Server) availability(w http.ResponseWriter, r *http.Request) {
 }
 
 type createBookingReq struct {
-	BusinessSlug string   `json:"business_slug"`
-	StaffID      string   `json:"staff_id"`
-	StartsAt     string   `json:"starts_at"`
-	ServiceIDs   []string `json:"service_ids"`
-	ClientName   string   `json:"client_name"`
-	ClientPhone  string   `json:"client_phone"`
-	ClientEmail  string   `json:"client_email"` // for the payment receipt when a deposit is paid online
-	Notes        string   `json:"notes"`
-	Source       string   `json:"source"`
-	PromoCode    string   `json:"promo_code"`
+	BusinessSlug string         `json:"business_slug"`
+	StaffID      string         `json:"staff_id"`
+	StartsAt     string         `json:"starts_at"`
+	ServiceIDs   []string       `json:"service_ids"`
+	ClientName   string         `json:"client_name"`
+	ClientPhone  string         `json:"client_phone"`
+	ClientEmail  string         `json:"client_email"` // for the payment receipt when a deposit is paid online
+	Notes        string         `json:"notes"`
+	Source       string         `json:"source"`
+	PromoCode    string         `json:"promo_code"`
+	GuestName    string         `json:"guest_name"` // who is coming, when it is not the person booking
+	Answers      []intakeAnswer `json:"answers"`
 }
 
 // POST /v1/bookings
@@ -246,8 +248,26 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	end := start.Add(time.Duration(dur+buf) * time.Minute)
+	// The person must really be free: not blocked off (by hand or by their own calendar) and not on approved time off.
+	var away bool
+	_ = s.pool.QueryRow(ctx, `select exists(select 1 from calendar_blocks cb where cb.staff_id::text=$1 and cb.starts_at < $3 and cb.ends_at > $2)
+		or exists(select 1 from time_off t where t.staff_id::text=$1 and t.status='approved' and ($2 at time zone $4)::date between t.starts_on and t.ends_on)`, req.StaffID, start, end, fmt.Sprint(biz["timezone"])).Scan(&away)
+	if away {
+		writeErr(w, 409, "that time is no longer free; please choose another")
+		return
+	}
 	if taken := clash(s.resourcesFor(ctx, fmt.Sprint(biz["id"]), req.ServiceIDs, start, end, ""), start, end); taken != "" {
 		writeErr(w, 409, "that time has just been taken; please choose another")
+		return
+	}
+	req.GuestName = strings.TrimSpace(req.GuestName)
+	if len(req.GuestName) > 80 {
+		writeErr(w, 400, "keep the name under 80 characters")
+		return
+	}
+	answers, why := checkAnswers(s.intakeFor(ctx, fmt.Sprint(biz["id"]), req.ServiceIDs), req.Answers)
+	if why != "" {
+		writeErr(w, 400, why)
 		return
 	}
 	list := total // the price for this time and person, before any promo code
@@ -323,6 +343,17 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	series, _ := ctx.Value(seriesKey{}).(string)
+	if _, err := tx.Exec(ctx, `update bookings set guest_name=$2, series_id=nullif($3,'')::uuid where id=$1`, bookingID, req.GuestName, series); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	for _, a := range answers {
+		if _, err := tx.Exec(ctx, `insert into booking_answers (booking_id, question_id, label, kind, answer, sort) values ($1,$2,$3,$4,$5,$6)`, bookingID, a["question_id"], a["label"], a["kind"], a["answer"], a["sort"]); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
 	openLead(ctx, tx, fmt.Sprint(biz["id"]), bookingID, clientID, req.ClientName, req.Source, total)
 	if uid := s.customerID(r); uid != nil {
 		if _, err := tx.Exec(ctx, `update bookings set user_id=$2 where id=$1`, bookingID, *uid); err != nil {
@@ -378,7 +409,7 @@ func (s *Server) getBooking(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getBookingByID(w http.ResponseWriter, r *http.Request, id string, status int) {
 	ctx := r.Context()
-	bk, err := row(ctx, s.pool, `select bk.id, bk.status, bk.starts_at, bk.ends_at, bk.client_name, bk.total_cents, bk.discount_cents, bk.promo_code, bk.deposit_cents, bk.deposit_paid, bk.notes, bk.source,
+	bk, err := row(ctx, s.pool, `select bk.id, bk.status, bk.starts_at, bk.ends_at, bk.client_name, bk.total_cents, bk.discount_cents, bk.promo_code, bk.deposit_cents, bk.deposit_paid, bk.notes, bk.source, bk.guest_name, bk.series_id,
 		b.name as business, b.slug as business_slug, b.currency, b.timezone, st.name as staff, l.address, l.city
 		from bookings bk join businesses b on b.id=bk.business_id join staff st on st.id=bk.staff_id left join locations l on l.id=bk.location_id where bk.id=$1`, id)
 	if err != nil {

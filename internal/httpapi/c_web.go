@@ -292,7 +292,7 @@ func (s *Server) bookingCalendar(w http.ResponseWriter, r *http.Request) {
 // GET /v1/auth/bookings/{id}   one of the client's own bookings, with what they may still do to it
 func (s *Server) authBooking(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	b, err := row(ctx, s.pool, `select bk.id, bk.status, bk.starts_at, bk.ends_at, bk.total_cents, bk.discount_cents, bk.deposit_cents, bk.deposit_paid, bk.notes, bk.staff_id, bk.business_id,
+	b, err := row(ctx, s.pool, `select bk.id, bk.status, bk.starts_at, bk.ends_at, bk.total_cents, bk.discount_cents, bk.deposit_cents, bk.deposit_paid, bk.notes, bk.staff_id, bk.business_id, bk.guest_name, bk.series_id,
 		b.name as business, b.slug, b.currency, b.timezone, b.tone, st.name as staff, l.address, l.city,
 		(select coalesce(array_agg(bi.service_id::text) filter (where bi.service_id is not null), '{}') from booking_items bi where bi.booking_id = bk.id) as service_ids,
 		(select string_agg(name, ', ') from booking_items where booking_id = bk.id) as services

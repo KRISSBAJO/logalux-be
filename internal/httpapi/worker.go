@@ -44,6 +44,7 @@ func StartWorker(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) {
 					s.once(ctx, 7308, func(c context.Context) { s.billPlans(c) })
 					s.once(ctx, 7309, func(c context.Context) { s.summariseReviews(c) })
 					s.once(ctx, 7310, func(c context.Context) { s.awardReferrals(c) })
+					s.once(ctx, 7311, func(c context.Context) { s.importCalendars(c) })
 				}
 			}
 		}
