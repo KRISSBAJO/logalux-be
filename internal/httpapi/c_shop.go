@@ -121,6 +121,9 @@ func (s *Server) authProductReview(w http.ResponseWriter, r *http.Request) {
 		Rating int    `json:"rating"`
 		Body   string `json:"body"`
 	}
+	if !needVerified(w, c) {
+		return
+	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, "invalid json")
 		return

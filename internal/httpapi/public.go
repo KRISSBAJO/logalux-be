@@ -73,8 +73,11 @@ func (s *Server) listBusinesses(w http.ResponseWriter, r *http.Request) {
 			promoted = append(promoted, fmt.Sprint(b["id"]))
 		}
 	}
-	s.countLeadEvents("impression", seen...)
-	s.countLeadEvents("promoted_impression", promoted...)
+	// A sitemap build or another machine reading the list is not a person looking at it.
+	if q.Get("quiet") != "1" {
+		s.countLeadEvents("impression", seen...)
+		s.countLeadEvents("promoted_impression", promoted...)
+	}
 	// Every match as a light map pin, so the map shows the whole city while the list shows one page.
 	pins, _ := rows(r.Context(), s.pool, `
 		select b.slug, b.name, b.rating, b.currency, l.lat, l.lng, `+fromPrice+` as from_cents

@@ -58,6 +58,8 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_SECURE: ${SMTP_SECURE:-false}
       WEB_URL: ${WEB_URL:-http://localhost:3100}
+      RATE_LIMITS: ${RATE_LIMITS:-on}
+      WEB_API_KEY: ${WEB_API_KEY:-}
       MERCHANT_DEMO_PASSWORD: ${MERCHANT_DEMO_PASSWORD:-}
       AWS_REGION: ${AWS_REGION:-}
       AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}

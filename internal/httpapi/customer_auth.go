@@ -30,6 +30,8 @@ type Customer struct {
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
 	Phone     string `json:"phone"`
+	// False until they open the link we email at sign-up.
+	EmailVerified bool `json:"email_verified"`
 }
 
 func bearer(r *http.Request) string {
@@ -43,9 +45,9 @@ func (s *Server) customerFrom(ctx context.Context, token string) (Customer, bool
 	if token == "" {
 		return c, false
 	}
-	err := s.pool.QueryRow(ctx, `select u.id::text, coalesce(u.email,''), u.first_name, u.last_name, coalesce(u.phone,'')
+	err := s.pool.QueryRow(ctx, `select u.id::text, coalesce(u.email,''), u.first_name, u.last_name, coalesce(u.phone,''), u.email_verified_at is not null
 		from user_sessions s join users u on u.id = s.user_id where s.token_hash = $1 and s.expires_at > now()`, hashToken(token)).
-		Scan(&c.ID, &c.Email, &c.FirstName, &c.LastName, &c.Phone)
+		Scan(&c.ID, &c.Email, &c.FirstName, &c.LastName, &c.Phone, &c.EmailVerified)
 	return c, err == nil
 }
 
@@ -161,6 +163,7 @@ func (s *Server) authSignup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "the account was created, but we could not sign you in; try signing in")
 		return
 	}
+	s.sendVerifyEmail(ctx, id, req.Email, req.FirstName)
 	writeJSON(w, 201, M{"token": tok, "expires_in": int(userSessionTTL.Seconds()), "user": Customer{ID: id, Email: req.Email, FirstName: req.FirstName, LastName: req.LastName, Phone: phone}})
 }
 
@@ -397,7 +400,7 @@ func (s *Server) authReset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	_, _ = tx.Exec(ctx, `update users set password_hash=$2, failed_logins=0, locked_until=null where id=$1`, id, string(hash))
+	_, _ = tx.Exec(ctx, `update users set password_hash=$2, failed_logins=0, locked_until=null, email_verified_at = coalesce(email_verified_at, now()) where id=$1`, id, string(hash))
 	_, _ = tx.Exec(ctx, `delete from user_sessions where user_id=$1`, id)
 	_, _ = tx.Exec(ctx, `update user_password_resets set used_at = now() where user_id=$1 and used_at is null`, id)
 	if err := tx.Commit(ctx); err != nil {

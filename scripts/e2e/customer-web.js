@@ -3,7 +3,7 @@
 // the shop filters, an order with two sellers, each seller's fulfilment and
 // pay, and product reviews. It uses one throwaway customer on the sample
 // business "ada" and removes what it made. Run with simulated payments:
-//   STRIPE_SECRET_KEY= PAYSTACK_SECRET_KEY= MAIL_PROVIDER=log docker compose up -d api
+//   RATE_LIMITS=off STRIPE_SECRET_KEY= PAYSTACK_SECRET_KEY= MAIL_PROVIDER=log docker compose up -d api
 //   node scripts/e2e/customer-web.js
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -23,6 +23,7 @@ const sql = (q) => execSync("docker exec -i logaluxe-db psql -U logaluxe -d loga
 (async () => {
   let r = await call("POST", "/auth/signup", { first_name: "Cleo", last_name: "Webster", email: EMAIL, phone: "+16155550811", password: PASS });
   check("a customer signs up", r.status === 201 || r.status === 200, r.text); const C = r.json.token;
+  sql(`update users set email_verified_at = now() where email = '${EMAIL}'`); // confirming by email is covered in safety.js
   const g = (p) => call("GET", p, undefined, C), p = (path, body, method = "POST") => call(method, path, body, C);
   const M = (await call("POST", "/m/login", { email: "ada@logaluxe.test", password: MPW })).json.token;
 

@@ -285,6 +285,7 @@ func (s *Server) mLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
+		Code     string `json:"code"` // six digits from an authenticator app, or a recovery code
 	}
 	if err := readJSON(r, &req); err != nil || req.Email == "" || req.Password == "" {
 		writeErr(w, 400, "enter your email and password")
@@ -292,7 +293,9 @@ func (s *Server) mLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	var id, hash string
 	var locked *time.Time
-	err := s.pool.QueryRow(ctx, `select id::text, password_hash, locked_until from merchant_users where lower(email) = lower($1)`, strings.TrimSpace(req.Email)).Scan(&id, &hash, &locked)
+	var twoStep bool
+	var secret *string
+	err := s.pool.QueryRow(ctx, `select id::text, password_hash, locked_until, totp_enabled, totp_secret from merchant_users where lower(email) = lower($1)`, strings.TrimSpace(req.Email)).Scan(&id, &hash, &locked, &twoStep, &secret)
 	if err != nil {
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(req.Password))
 		writeErr(w, http.StatusUnauthorized, "wrong email or password")
@@ -307,6 +310,19 @@ func (s *Server) mLogin(w http.ResponseWriter, r *http.Request) {
 			locked_until = case when failed_logins + 1 >= 6 then now() + interval '15 minutes' else locked_until end where id = $1`, id)
 		writeErr(w, http.StatusUnauthorized, "wrong email or password")
 		return
+	}
+	if twoStep && secret != nil {
+		if strings.TrimSpace(req.Code) == "" {
+			writeJSON(w, http.StatusUnauthorized, M{"error": "enter the 6-digit code from your authenticator app", "need_code": true})
+			return
+		}
+		if !s.checkMerchantSecondStep(ctx, id, *secret, req.Code) {
+			// A wrong code counts towards the lockout, like a wrong password.
+			_, _ = s.pool.Exec(ctx, `update merchant_users set failed_logins = failed_logins + 1,
+				locked_until = case when failed_logins + 1 >= 6 then now() + interval '15 minutes' else locked_until end where id = $1`, id)
+			writeJSON(w, http.StatusUnauthorized, M{"error": "that code is not right", "need_code": true})
+			return
+		}
 	}
 	// Open the business they used last, or the first they belong to.
 	var bizID string

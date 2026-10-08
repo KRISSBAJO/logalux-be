@@ -17,16 +17,18 @@ import (
 )
 
 type Server struct {
-	cfg   config.Config
-	pool  *pgxpool.Pool
-	store *storage.S3 // nil when image storage is not configured
-	mail  *mail.Mailer
+	cfg    config.Config
+	pool   *pgxpool.Pool
+	store  *storage.S3 // nil when image storage is not configured
+	mail   *mail.Mailer
+	limits *limiter
 }
 
 func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	s := &Server{cfg: cfg, pool: pool, store: storage.New(cfg.AWSRegion, cfg.AWSBucket, cfg.AWSAccessKey, cfg.AWSSecretKey),
 		mail: mail.New(mail.Config{Provider: cfg.MailProvider, From: cfg.MailFrom, ResendKey: cfg.ResendKey,
 			SMTPHost: cfg.SMTPHost, SMTPPort: cfg.SMTPPort, SMTPUser: cfg.SMTPUser, SMTPPass: cfg.SMTPPass, SMTPSecure: cfg.SMTPSecure})}
+	s.limits = newLimiter()
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
@@ -50,31 +52,33 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		r.Get("/businesses/{slug}/reviews", s.businessReviews)
 		r.Get("/openings", s.openingsBatch)
 		r.Get("/bookings/{id}/calendar.ics", s.bookingCalendar)
-		r.Post("/bookings", s.createBooking)
+		r.With(s.limit("book", 30, time.Hour)).Post("/bookings", s.createBooking)
 		r.Get("/bookings/{id}", s.getBooking)
-		r.Post("/waitlist", s.joinWaitlist)
+		r.With(s.limit("waitlist", 20, time.Hour)).Post("/waitlist", s.joinWaitlist)
 
 		r.Get("/products", s.listProducts)
 		r.Get("/products/{slug}", s.getProduct)
-		r.Post("/orders", s.createOrder)
+		r.With(s.limit("order", 30, time.Hour)).Post("/orders", s.createOrder)
 		r.Get("/orders/{id}", s.getOrder)
 
 		r.Get("/site/media", s.siteMedia)
 		r.Get("/media/{id}", s.mediaFile)
 
-		r.Post("/checkout/check", s.checkoutCheck)
+		r.With(s.limit("codes", 40, 10*time.Minute)).Post("/checkout/check", s.checkoutCheck)
 
 		// Customer accounts.
-		r.Post("/auth/signup", s.authSignup)
-		r.Post("/auth/login", s.authLogin)
+		r.With(s.limit("signup", 10, time.Hour)).Post("/auth/signup", s.authSignup)
+		r.With(s.limit("login", 20, 10*time.Minute)).Post("/auth/login", s.authLogin)
 		r.Post("/auth/logout", s.authLogout)
-		r.Post("/auth/forgot", s.authForgot)
-		r.Post("/auth/reset", s.authReset)
+		r.With(s.limit("forgot", 6, time.Hour)).Post("/auth/forgot", s.authForgot)
+		r.With(s.limit("reset", 20, time.Hour)).Post("/auth/reset", s.authReset)
+		r.With(s.limit("verify", 30, 10*time.Minute)).Post("/auth/verify", s.authVerify)
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireCustomer)
 			r.Get("/auth/me", s.authMe)
 			r.Put("/auth/me", s.authUpdate)
 			r.Post("/auth/password", s.authPassword)
+			r.Post("/auth/verify/send", s.authVerifySend)
 			r.Post("/auth/bookings/{id}/cancel", s.authCancelBooking)
 			r.Post("/auth/bookings/{id}/review", s.authReview)
 			r.Get("/auth/threads", s.authThreads)
@@ -89,7 +93,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Post("/auth/threads", s.authThreadSend)
 			r.Get("/auth/threads/{id}", s.authThread)
 		})
-		r.Post("/support", s.supportCreate)
+		r.With(s.limit("support", 10, time.Hour)).Post("/support", s.supportCreate)
 		r.Get("/pages/{slug}", s.sitePage)
 
 		// The merchant web: people who run a business.
@@ -98,11 +102,11 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		r.Post("/webhooks/stripe", s.stripeWebhook)
 		r.Post("/webhooks/paystack", s.paystackWebhook)
 
-		r.Post("/m/signup", s.mSignup)
-		r.Post("/m/login", s.mLogin)
+		r.With(s.limit("m-signup", 6, time.Hour)).Post("/m/signup", s.mSignup)
+		r.With(s.limit("m-login", 20, 10*time.Minute)).Post("/m/login", s.mLogin)
 		r.Post("/m/logout", s.mLogout)
-		r.Post("/m/forgot", s.mForgot)
-		r.Post("/m/reset", s.mReset)
+		r.With(s.limit("m-forgot", 6, time.Hour)).Post("/m/forgot", s.mForgot)
+		r.With(s.limit("m-reset", 20, time.Hour)).Post("/m/reset", s.mReset)
 		r.Route("/m", func(r chi.Router) {
 			r.Use(s.requireMerchant)
 
@@ -110,6 +114,10 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Get("/me", s.mMe)
 			r.Post("/switch", s.mSwitch)
 			r.Post("/password", s.mPassword)
+			r.Get("/security", s.mSecurity)
+			r.Post("/2fa/setup", s.m2FASetup)
+			r.Post("/2fa/enable", s.m2FAEnable)
+			r.Post("/2fa/disable", s.m2FADisable)
 			r.Put("/account", s.mAccount)
 			r.Get("/home", s.mHome)
 			r.Get("/calendar", s.mCalendar)
@@ -250,9 +258,9 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			})
 		})
 
-		r.Post("/admin/login", s.adminLogin)
-		r.Post("/admin/forgot", s.adminForgot)
-		r.Post("/admin/reset", s.adminReset)
+		r.With(s.limit("a-login", 15, 10*time.Minute)).Post("/admin/login", s.adminLogin)
+		r.With(s.limit("a-forgot", 6, time.Hour)).Post("/admin/forgot", s.adminForgot)
+		r.With(s.limit("a-reset", 20, time.Hour)).Post("/admin/reset", s.adminReset)
 
 		r.Route("/admin", func(r chi.Router) {
 			r.Use(s.requireAdmin)
@@ -346,6 +354,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 				r.Post("/team", s.adminTeamCreate)
 				r.Put("/team/{id}", s.adminTeamUpdate)
 				r.Post("/team/{id}/reset-2fa", s.adminTeamReset2FA)
+				r.Post("/merchants/reset-2fa", s.adminMerchantReset2FA)
 				r.Post("/broadcasts/{id}/send", s.adminBroadcastSend)
 				r.Put("/pages/{slug}", s.adminPageUpdate)
 			})

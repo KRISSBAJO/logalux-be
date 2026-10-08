@@ -49,6 +49,8 @@ type Config struct {
 	SMTPPass     string
 	SMTPSecure   bool
 	WebURL       string // public address of the website, for links in emails
+	RateLimits   bool   // per-connection limits on sign-in, sign-up, codes, bookings and orders; RATE_LIMITS=off turns them off for test runs
+	WebAPIKey    string // shared with the web app, so the API believes the visitor address it passes on
 
 	// Password for the sample business owners (ada@logaluxe.test and so on). Only used with SEED=true.
 	MerchantDemoPassword string
@@ -95,6 +97,8 @@ func Load() (Config, error) {
 		SMTPPass:             os.Getenv("SMTP_PASSWORD"),
 		SMTPSecure:           os.Getenv("SMTP_SECURE") == "true",
 		WebURL:               get("WEB_URL", "http://localhost:3100"),
+		RateLimits:           strings.ToLower(os.Getenv("RATE_LIMITS")) != "off",
+		WebAPIKey:            os.Getenv("WEB_API_KEY"),
 		MerchantDemoPassword: os.Getenv("MERCHANT_DEMO_PASSWORD"),
 		StripeSecret:         os.Getenv("STRIPE_SECRET_KEY"),
 		PaystackSecret:       os.Getenv("PAYSTACK_SECRET_KEY"),

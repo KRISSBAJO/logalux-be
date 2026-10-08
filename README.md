@@ -162,6 +162,14 @@ Booking: `instant` (off means a booking starts as a request), `lead_hours`, `max
 
 The screens are in `logaluxe-web`: `/search`, `/b/{slug}`, `/b/{slug}/book`, `/shop`, `/shop/{slug}`, `/cart`, `/account`, and a business's online orders at `/business/inventory?tab=orders`.
 
+### Launch safety
+
+- **Customers confirm their email.** Sign-up emails a link to `/verify?token=` (48 hours). `POST /v1/auth/verify` `{token}` confirms the address the link was sent to; `POST /v1/auth/verify/send` sends it again, at most every two minutes. `user.email_verified` is in every account answer. Reviews of a business or a product need a confirmed email. Using a password reset link also confirms it.
+- **Request limits.** One connection may make only so many tries at sign-in, sign-up, reset emails, promo and gift codes, bookings, orders, the waitlist and the help form (`safety.go`); past that the API answers 429 with `Retry-After`. This is on top of the 15 minute lock each account already gets after repeated wrong passwords. Counts are kept in memory per API process. The web app passes the visitor's address in `X-Visitor-IP`; set the same `WEB_API_KEY` on the API and the web app so the API believes it (required in production). `RATE_LIMITS=off` turns the limits off for the end-to-end suites, which make many accounts from one address.
+- **Two-step sign-in for businesses.** `GET /v1/m/security`, `POST /v1/m/2fa/setup`, `/2fa/enable` `{code}` (returns eight recovery codes once), `/2fa/disable` `{password}`. `POST /v1/m/login` then needs `code` and answers `need_code: true` without one. A super admin can reset it for someone who lost their phone: `POST /v1/admin/merchants/reset-2fa` `{email}`. In the web app it is under Settings, Your account.
+- **Search engines.** The web app serves `/robots.txt`, `/sitemap.xml`, a web app manifest, structured data on business, product and listing pages, and a page per city and service (`/nashville`, `/lagos/barbers`). Set `NEXT_PUBLIC_SITE_URL` to the public address. `GET /v1/businesses?quiet=1` lists without counting views, for the sitemap.
+- Test: `node scripts/e2e/safety.js` with mail logged and the limits on. Every other suite: start the API with `RATE_LIMITS=off` as well.
+
 ### The lead system
 
 LogaLuxe earns a share of the first visit of a client it brought to a business. It is the `new_client_pct` in the fee schedule, per market and plan, with a cap (`new_client_cap_cents`) and an optional adjustment per kind of business (`lead_category_rates`).
