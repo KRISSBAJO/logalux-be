@@ -1,0 +1,84 @@
+# LogaLuxe local stack: Postgres 16, Redis, and the Go API.
+# Host ports stay below 49152 because Windows reserves shifting blocks above it.
+# Copy .env.example to .env first.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: logaluxe-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-logaluxe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-logaluxe}
+    ports:
+      - "127.0.0.1:15433:5432"
+    volumes:
+      - logaluxe_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-logaluxe} -d ${POSTGRES_DB:-logaluxe}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: logaluxe-redis
+    ports:
+      - "127.0.0.1:16380:6379"
+    volumes:
+      - logaluxe_redis:/data
+
+  api:
+    build: .
+    container_name: logaluxe-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 18080
+      APP_ENV: ${APP_ENV:-development}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-logaluxe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-logaluxe}
+      REDIS_URL: redis://redis:6379
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3100}
+      SEED: ${SEED:-true}
+      MAIL_PROVIDER: ${MAIL_PROVIDER:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      WEB_URL: ${WEB_URL:-http://localhost:3100}
+      MERCHANT_DEMO_PASSWORD: ${MERCHANT_DEMO_PASSWORD:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_S3_BUCKET: ${AWS_S3_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      SMS_ENABLED: ${SMS_ENABLED:-false}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      TERMII_API_KEY: ${TERMII_API_KEY:-}
+      TERMII_BASE_URL: ${TERMII_BASE_URL:-}
+      TERMII_FROM: ${TERMII_FROM:-}
+      FLUTTERWAVE_SECRET_KEY: ${FLUTTERWAVE_SECRET_KEY:-}
+    ports:
+      - "127.0.0.1:18080:18080"
+
+volumes:
+  logaluxe_pg:
+  logaluxe_redis:

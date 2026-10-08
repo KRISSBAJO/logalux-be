@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+bin/
+tmp/
+*.exe
+.certs/
+docker-compose.override.yml
+tmp-api.log

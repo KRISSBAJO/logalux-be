@@ -1,0 +1,392 @@
+// Package httpapi exposes the REST API. Public routes serve the customer and
+// merchant apps; /v1/admin routes need a signed-in admin and check their role.
+package httpapi
+
+import (
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"logaluxe/api/internal/config"
+	"logaluxe/api/internal/mail"
+	"logaluxe/api/internal/storage"
+)
+
+type Server struct {
+	cfg   config.Config
+	pool  *pgxpool.Pool
+	store *storage.S3 // nil when image storage is not configured
+	mail  *mail.Mailer
+}
+
+func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
+	s := &Server{cfg: cfg, pool: pool, store: storage.New(cfg.AWSRegion, cfg.AWSBucket, cfg.AWSAccessKey, cfg.AWSSecretKey),
+		mail: mail.New(mail.Config{Provider: cfg.MailProvider, From: cfg.MailFrom, ResendKey: cfg.ResendKey,
+			SMTPHost: cfg.SMTPHost, SMTPPort: cfg.SMTPPort, SMTPUser: cfg.SMTPUser, SMTPPass: cfg.SMTPPass, SMTPSecure: cfg.SMTPSecure})}
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
+	r.Use(middleware.Timeout(60 * time.Second))
+	r.Use(s.cors)
+	r.Use(logRequests)
+
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		if err := pool.Ping(r.Context()); err != nil {
+			writeErr(w, http.StatusServiceUnavailable, "database unreachable")
+			return
+		}
+		writeJSON(w, 200, M{"ok": true, "env": cfg.Env, "payments": cfg.PaymentsMode()})
+	})
+
+	r.Route("/v1", func(r chi.Router) {
+		r.Get("/businesses", s.listBusinesses)
+		r.Get("/businesses/{slug}", s.getBusiness)
+		r.Get("/businesses/{slug}/availability", s.availability)
+		r.Get("/businesses/{slug}/openings", s.openings)
+		r.Get("/businesses/{slug}/days", s.openDays)
+		r.Get("/businesses/{slug}/reviews", s.businessReviews)
+		r.Get("/openings", s.openingsBatch)
+		r.Get("/bookings/{id}/calendar.ics", s.bookingCalendar)
+		r.Post("/bookings", s.createBooking)
+		r.Get("/bookings/{id}", s.getBooking)
+		r.Post("/waitlist", s.joinWaitlist)
+
+		r.Get("/products", s.listProducts)
+		r.Get("/products/{slug}", s.getProduct)
+		r.Post("/orders", s.createOrder)
+		r.Get("/orders/{id}", s.getOrder)
+
+		r.Get("/site/media", s.siteMedia)
+		r.Get("/media/{id}", s.mediaFile)
+
+		r.Post("/checkout/check", s.checkoutCheck)
+
+		// Customer accounts.
+		r.Post("/auth/signup", s.authSignup)
+		r.Post("/auth/login", s.authLogin)
+		r.Post("/auth/logout", s.authLogout)
+		r.Post("/auth/forgot", s.authForgot)
+		r.Post("/auth/reset", s.authReset)
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireCustomer)
+			r.Get("/auth/me", s.authMe)
+			r.Put("/auth/me", s.authUpdate)
+			r.Post("/auth/password", s.authPassword)
+			r.Post("/auth/bookings/{id}/cancel", s.authCancelBooking)
+			r.Post("/auth/bookings/{id}/review", s.authReview)
+			r.Get("/auth/threads", s.authThreads)
+			r.Get("/auth/bookings/{id}", s.authBooking)
+			r.Post("/auth/bookings/{id}/reschedule", s.authReschedule)
+			r.Get("/auth/favourites", s.authFavourites)
+			r.Put("/auth/favourites/{slug}", s.authFavouriteSet)
+			r.Delete("/auth/favourites/{slug}", s.authFavouriteSet)
+			r.Get("/auth/wallet", s.authWallet)
+			r.Post("/auth/products/{slug}/review", s.authProductReview)
+			r.Post("/auth/orders/{id}/cancel", s.authOrderCancel)
+			r.Post("/auth/threads", s.authThreadSend)
+			r.Get("/auth/threads/{id}", s.authThread)
+		})
+		r.Post("/support", s.supportCreate)
+		r.Get("/pages/{slug}", s.sitePage)
+
+		// The merchant web: people who run a business.
+		// Payments: the client coming back from the provider's page, and the providers' own calls.
+		r.Post("/payments/{ref}/confirm", s.payConfirm)
+		r.Post("/webhooks/stripe", s.stripeWebhook)
+		r.Post("/webhooks/paystack", s.paystackWebhook)
+
+		r.Post("/m/signup", s.mSignup)
+		r.Post("/m/login", s.mLogin)
+		r.Post("/m/logout", s.mLogout)
+		r.Post("/m/forgot", s.mForgot)
+		r.Post("/m/reset", s.mReset)
+		r.Route("/m", func(r chi.Router) {
+			r.Use(s.requireMerchant)
+
+			// Everyone on the team: the day's work.
+			r.Get("/me", s.mMe)
+			r.Post("/switch", s.mSwitch)
+			r.Post("/password", s.mPassword)
+			r.Put("/account", s.mAccount)
+			r.Get("/home", s.mHome)
+			r.Get("/calendar", s.mCalendar)
+			r.Get("/availability", s.mAvailability)
+			r.Get("/bookings", s.mBookingSearch)
+			r.Post("/bookings", s.mBookingCreate)
+			r.Get("/bookings/{id}", s.mBooking)
+			r.Post("/bookings/{id}/action", s.mBookingAction)
+			r.Post("/blocks", s.mBlockCreate)
+			r.Delete("/blocks/{id}", s.mBlockDelete)
+			r.Get("/waitlist", s.mWaitlist)
+			r.Put("/waitlist/{id}", s.mWaitlistUpdate)
+			r.Get("/clients", s.mClients)
+			r.Get("/clients/{id}", s.mClient)
+			r.Post("/clients", s.mClientCreate)
+			r.Put("/clients/{id}", s.mClientUpdate)
+			r.Get("/checkout", s.mCheckout)
+			r.Post("/checkout", s.mCheckoutPay)
+			r.Post("/checkout/link", s.mCheckoutLink)
+			r.Get("/payments/{ref}", s.mPayment)
+			r.Get("/checkout/day", s.mCheckoutDay)
+			r.Get("/inbox", s.mInbox)
+			r.Post("/inbox", s.mThreadCreate)
+			r.Get("/inbox/{id}", s.mThread)
+			r.Post("/inbox/{id}/reply", s.mThreadReply)
+			r.Put("/inbox/{id}", s.mThreadUpdate)
+			r.Get("/services", s.mServices)
+			r.Get("/menu", s.mMenu)
+			r.Get("/ai", s.mAI)
+			r.Post("/ai/reply", s.mAIReply)
+			r.Get("/price-check", s.mPriceCheck)
+			r.Get("/clients/{id}/plans", s.mClientPlans)
+			r.With(s.mNeedPerm("manager", "see_reports")).Get("/reports", s.mReports)
+			r.With(s.mNeedPerm("manager", "see_reports")).Get("/reports/export", s.mReportsExport)
+			r.Get("/staff", s.mStaff)
+			r.Post("/time-off", s.mTimeOffCreate)
+
+			// Managers and the owner: the menu, the team, stock, marketing and the numbers.
+			r.Group(func(r chi.Router) {
+				r.Use(s.mNeed("manager"))
+				r.Post("/clients/import", s.mClientImport)
+				r.Get("/clients/export", s.mClientExport)
+				r.Post("/sales/{id}/refund", s.mSaleRefund)
+				r.Put("/saved-replies", s.mSavedReplies)
+				r.Post("/services", s.mServiceCreate)
+				r.Post("/services/import", s.mServiceImport)
+				r.Put("/services/{id}/resources", s.mServiceResources)
+				r.Post("/resources", s.mResourceSave)
+				r.Put("/resources/{id}", s.mResourceSave)
+				r.Delete("/resources/{id}", s.mResourceDelete)
+				r.Post("/price-rules", s.mPriceRuleSave)
+				r.Put("/price-rules/{id}", s.mPriceRuleSave)
+				r.Delete("/price-rules/{id}", s.mPriceRuleDelete)
+				r.Post("/packages", s.mPackageSave)
+				r.Put("/packages/{id}", s.mPackageSave)
+				r.Delete("/packages/{id}", s.mPackageDelete)
+				r.Post("/memberships", s.mMembershipSave)
+				r.Put("/memberships/{id}", s.mMembershipSave)
+				r.Delete("/memberships/{id}", s.mMembershipDelete)
+				r.Post("/client-plans/{id}", s.mClientPlanAction)
+				r.Post("/rent/{id}", s.mRentAction)
+				r.Post("/products/{id}/photo", s.mProductPhoto)
+				r.Delete("/products/{id}/photo", s.mProductPhotoDelete)
+				r.Put("/products/{id}/services", s.mProductServices)
+				r.Put("/services/order", s.mServiceOrder)
+				r.Put("/services/{id}", s.mServiceUpdate)
+				r.Post("/services/{id}/action", s.mServiceAction)
+				r.Post("/staff", s.mStaffCreate)
+				r.Put("/staff/{id}", s.mStaffUpdate)
+				r.Post("/staff/{id}/action", s.mStaffAction)
+				r.Post("/time-off/{id}", s.mTimeOffDecide)
+				r.Get("/payroll", s.mPayroll)
+				r.Get("/inventory", s.mInventory)
+				r.Get("/orders", s.mOrders)
+				r.Post("/orders/{id}", s.mOrderAction)
+				r.Post("/products", s.mProductCreate)
+				r.Put("/products/{id}", s.mProductUpdate)
+				r.Post("/products/{id}/stock", s.mProductStock)
+				r.Get("/products/{id}/history", s.mProductHistory)
+				r.Post("/suppliers", s.mSupplierCreate)
+				r.Delete("/suppliers/{id}", s.mSupplierDelete)
+				r.Post("/purchase-orders", s.mPurchaseOrderCreate)
+				r.Post("/purchase-orders/{id}", s.mPurchaseOrderAction)
+				r.Get("/marketing", s.mMarketing)
+				r.Get("/leads", s.mLeads)
+				r.Post("/ai/campaign", s.mAICampaign)
+				r.Get("/loyalty", s.mLoyalty)
+				r.Put("/loyalty/settings", s.mLoyaltySettings)
+				r.Post("/loyalty/adjust", s.mLoyaltyAdjust)
+				r.Get("/promos", s.mPromos)
+				r.Post("/promos", s.mPromoCreate)
+				r.Put("/promos/{id}", s.mPromoUpdate)
+				r.Delete("/promos/{id}", s.mPromoDelete)
+				r.Post("/products/{id}/transfer", s.mProductTransfer)
+				r.Post("/storefront/logo", s.mLogoUpload)
+				r.Delete("/storefront/logo", s.mLogoDelete)
+				r.Put("/automations/{key}", s.mAutomationUpdate)
+				r.Post("/campaigns", s.mCampaignCreate)
+				r.Delete("/campaigns/{id}", s.mCampaignDelete)
+				r.Post("/campaigns/{id}/test", s.mCampaignTest)
+				r.Post("/campaigns/{id}/send", s.mCampaignSend)
+				r.Get("/storefront", s.mStorefront)
+				r.Put("/storefront", s.mStorefrontUpdate)
+				r.Post("/storefront/photos", s.mPhotoUpload)
+				r.Put("/storefront/photos", s.mPhotoOrder)
+				r.Put("/storefront/photos/{id}", s.mPhotoUpdate)
+				r.Delete("/storefront/photos/{id}", s.mPhotoDelete)
+				r.Post("/reviews/{id}", s.mReviewUpdate)
+				r.Get("/settings", s.mSettings)
+				r.Put("/settings/profile", s.mSettingsProfile)
+				r.Put("/settings/rules", s.mSettingsRules)
+				r.Post("/locations", s.mLocationCreate)
+				r.Put("/locations/{id}", s.mLocationUpdate)
+				r.Post("/locations/{id}/action", s.mLocationAction)
+			})
+
+			// The owner only: money, the payout account, the plan, and who can sign in.
+			r.Group(func(r chi.Router) {
+				r.Use(s.mNeed("owner"))
+				r.Get("/money", s.mMoney)
+				r.Get("/money/export", s.mMoneyExport)
+				r.Get("/statements", s.mStatements)
+				r.Get("/payments", s.mPayments)
+				r.Get("/statements/{month}", s.mStatement)
+				r.Post("/payouts", s.mPayoutNow)
+				r.Put("/payout-schedule", s.mPayoutSchedule)
+				r.Get("/payout-account", s.mPayoutAccount)
+				r.Post("/payout-account/bank", s.mPayoutBank)
+				r.Post("/payout-account/stripe", s.mPayoutStripe)
+				r.Post("/payout-account/{id}/default", s.mPayoutDefault)
+				r.Delete("/payout-account/{id}", s.mPayoutAccountDelete)
+				r.Post("/staff/{id}/invite", s.mStaffInvite)
+				r.Delete("/staff/{id}/invite", s.mStaffUninvite)
+				r.Post("/plan", s.mPlan)
+				r.Put("/leads/settings", s.mLeadSettings)
+				r.Post("/leads/{id}/dispute", s.mLeadDispute)
+				r.Post("/listing", s.mListing)
+			})
+		})
+
+		r.Post("/admin/login", s.adminLogin)
+		r.Post("/admin/forgot", s.adminForgot)
+		r.Post("/admin/reset", s.adminReset)
+
+		r.Route("/admin", func(r chi.Router) {
+			r.Use(s.requireAdmin)
+
+			// Every role: read the console, handle bookings, leave notes.
+			r.Post("/logout", s.adminLogout)
+			r.Get("/me", s.adminMe)
+			r.Get("/overview", s.adminOverview)
+			r.Get("/health", s.adminHealth)
+			r.Get("/search", s.adminSearch)
+			r.Get("/verification", s.adminVerification)
+			r.Get("/moderation", s.adminModeration)
+			r.Get("/leads", s.adminLeads)
+			r.Get("/disputes", s.adminDisputes)
+			r.Get("/businesses", s.adminBusinesses)
+			r.Get("/businesses/{id}", s.adminBusiness)
+			r.Post("/businesses/{id}/notes", s.adminBusinessNote)
+			r.Get("/bookings", s.adminBookings)
+			r.Post("/bookings/{id}/action", s.adminBookingAction)
+			r.Get("/clients", s.adminClients)
+			r.Get("/orders", s.adminOrders)
+			r.Get("/products", s.adminProducts)
+			r.Get("/payouts", s.adminPayouts)
+			r.Get("/fees", s.adminFees)
+			r.Get("/flags", s.adminFlags)
+			r.Get("/audit", s.adminAudit)
+			r.Get("/media", s.adminMedia)
+			r.Get("/account", s.adminAccount)
+			r.Post("/password", s.adminPassword)
+			r.Post("/2fa/setup", s.admin2FASetup)
+			r.Post("/2fa/enable", s.admin2FAEnable)
+			r.Post("/2fa/disable", s.admin2FADisable)
+			r.Get("/promos", s.adminPromos)
+			r.Get("/gift-cards", s.adminGiftCards)
+			r.Get("/support", s.adminSupport)
+			r.Get("/support/{id}", s.adminSupportTicket)
+			r.Post("/support/{id}/reply", s.adminSupportReply)
+			r.Put("/support/{id}", s.adminSupportUpdate)
+			r.Get("/broadcasts", s.adminBroadcasts)
+			r.Get("/pages", s.adminPages)
+
+			// Ops: decisions that move money or change what the public sees.
+			r.Group(func(r chi.Router) {
+				r.Use(s.need("ops"))
+				r.Post("/verification/{id}/decide", s.adminVerificationDecide)
+				r.Post("/moderation/{id}/decide", s.adminModerationDecide)
+				r.Post("/disputes/{id}/resolve", s.adminDisputeResolve)
+				r.Post("/leads/{id}/resolve", s.adminLeadResolve)
+				r.Post("/businesses/{id}/status", s.adminBusinessStatus)
+				r.Patch("/businesses/{id}", s.adminBusinessUpdate)
+				r.Post("/businesses/{id}/payout-hold", s.adminPayoutHold)
+				r.Post("/businesses/{id}/credits", s.adminCredit)
+				r.Post("/clients/block", s.adminClientBlock)
+				r.Post("/orders/{id}/status", s.adminOrderStatus)
+				r.Post("/products/{id}/active", s.adminProductActive)
+				r.Post("/payouts/{id}/action", s.adminPayoutAction)
+				r.Post("/media", s.adminMediaUpload)
+				r.Get("/export/{kind}", s.adminExport)
+				r.Post("/businesses", s.adminBusinessCreate)
+				r.Put("/businesses/{id}/profile", s.adminBusinessProfile)
+				r.Put("/locations/{id}", s.adminLocationUpdate)
+				r.Post("/businesses/{id}/services", s.adminServiceCreate)
+				r.Put("/services/{id}", s.adminServiceUpdate)
+				r.Delete("/services/{id}", s.adminServiceDelete)
+				r.Post("/businesses/{id}/staff", s.adminStaffCreate)
+				r.Put("/staff/{id}", s.adminStaffUpdate)
+				r.Delete("/staff/{id}", s.adminStaffDelete)
+				r.Post("/products", s.adminProductCreate)
+				r.Put("/products/{id}", s.adminProductUpdate)
+				r.Post("/promos", s.adminPromoCreate)
+				r.Put("/promos/{id}", s.adminPromoUpdate)
+				r.Delete("/promos/{id}", s.adminPromoDelete)
+				r.Post("/gift-cards", s.adminGiftCardIssue)
+				r.Post("/gift-cards/{id}/void", s.adminGiftCardVoid)
+				r.Post("/broadcasts", s.adminBroadcastCreate)
+				r.Delete("/broadcasts/{id}", s.adminBroadcastDelete)
+				r.Put("/media/{id}", s.adminMediaUpdate)
+				r.Delete("/media/{id}", s.adminMediaDelete)
+			})
+
+			// Super admin: pricing, rollouts, and who has access.
+			r.Group(func(r chi.Router) {
+				r.Use(s.need("super_admin"))
+				r.Post("/fees", s.adminFeesPropose)
+				r.Post("/fees/decide", s.adminFeesDecide)
+				r.Put("/leads/rates", s.adminLeadRate)
+				r.Post("/flags", s.adminFlagCreate)
+				r.Put("/flags/{key}", s.adminFlagUpdate)
+				r.Delete("/flags/{key}", s.adminFlagDelete)
+				r.Get("/team", s.adminTeam)
+				r.Post("/team", s.adminTeamCreate)
+				r.Put("/team/{id}", s.adminTeamUpdate)
+				r.Post("/team/{id}/reset-2fa", s.adminTeamReset2FA)
+				r.Post("/broadcasts/{id}/send", s.adminBroadcastSend)
+				r.Put("/pages/{slug}", s.adminPageUpdate)
+			})
+		})
+	})
+	return r
+}
+
+func (s *Server) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		for _, o := range s.cfg.CORSOrigins {
+			if o == origin || o == "*" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+				break
+			}
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+		slog.Info("http", "method", r.Method, "path", r.URL.Path, "status", ww.Status(), "ms", time.Since(start).Milliseconds())
+	})
+}
+
+// actor is the signed-in admin's email, written to the audit log.
+func (s *Server) actor(r *http.Request) string {
+	if a := currentAdmin(r); a.Email != "" {
+		return a.Email
+	}
+	return "unknown"
+}
