@@ -117,6 +117,7 @@ func (s *Server) authSignup(w http.ResponseWriter, r *http.Request) {
 		Email     string `json:"email"`
 		Phone     string `json:"phone"`
 		Password  string `json:"password"`
+		Ref       string `json:"ref"` // a friend's referral code, optional
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, "invalid json")
@@ -164,6 +165,7 @@ func (s *Server) authSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.sendVerifyEmail(ctx, id, req.Email, req.FirstName)
+	s.noteReferral(ctx, id, req.Ref)
 	writeJSON(w, 201, M{"token": tok, "expires_in": int(userSessionTTL.Seconds()), "user": Customer{ID: id, Email: req.Email, FirstName: req.FirstName, LastName: req.LastName, Phone: phone}})
 }
 
@@ -226,7 +228,9 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 		       b.name as business, b.slug, b.currency, b.timezone, b.tone, st.name as staff, l.address, l.city,
 		       (select string_agg(name, ', ') from booking_items where booking_id = bk.id) as services,
 		       (bk.status in ('requested','confirmed') and bk.starts_at > now()) as can_cancel,
-		       (bk.status in ('completed','paid') and not exists (select 1 from reviews rv where rv.booking_id = bk.id)) as can_review
+		       (bk.status in ('completed','paid') and not exists (select 1 from reviews rv where rv.booking_id = bk.id)) as can_review,
+		       (select rv.id from reviews rv where rv.booking_id = bk.id limit 1) as review_id,
+		       (select coalesce(json_agg(sm.id order by sm.sort, sm.created_at), '[]') from site_media sm join reviews rv on rv.id::text = sm.ref where sm.slot='review' and rv.booking_id = bk.id) as review_photos
 		from bookings bk join businesses b on b.id = bk.business_id join staff st on st.id = bk.staff_id left join locations l on l.id = bk.location_id
 		where bk.user_id = $1 order by bk.starts_at desc limit 60`, c.ID)
 	if err != nil {

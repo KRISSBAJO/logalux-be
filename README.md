@@ -162,6 +162,21 @@ Booking: `instant` (off means a booking starts as a request), `lead_hours`, `max
 
 The screens are in `logaluxe-web`: `/search`, `/b/{slug}`, `/b/{slug}/book`, `/shop`, `/shop/{slug}`, `/cart`, `/account`, and a business's online orders at `/business/inventory?tab=orders`.
 
+### Customer extras
+
+Each of these was drawn in the design and now has real data behind it (`c_extras.go`, migration 0022).
+
+- **What a business says about itself.** `GET /v1/businesses/{slug}` returns `extras`: the languages it speaks, its returns policy, delivery time and pick-up promise, and `reply_minutes`, the median time it took to answer clients over 90 days (absent until there are three replies to measure). A business sets these with `GET|PUT /v1/m/shop-policy`; a number left `null` means "not stated" and the page then says nothing.
+- **Product details.** `PUT /v1/m/products/{id}/details` `{ingredients, how_to_use}`; `PUT /v1/admin/products/{id}/details` adds delivery time and returns for brand products. `GET /v1/products/{slug}` returns `extras`: ingredients, delivery, returns, `pickup_today` (only while the seller is open and the item can be ready before closing), and for a signed-in customer `saved` and `next_visit`. `GET /v1/products-extras?slugs=` gives the same for a cart.
+- **Pick up at the visit.** No new request field: when a customer who collects has a visit booked with that seller, the API writes it on the seller's part of the order (`note` in `GET /v1/m/orders`).
+- **Saved products.** `GET /v1/auth/favourite-products`, `PUT|DELETE /v1/auth/favourite-products/{slug}`.
+- **Photos on reviews.** `POST /v1/auth/reviews/{id}/photos` (the author, up to three, confirmed email), `DELETE /v1/auth/review-photos/{id}`. Review lists carry `photos`.
+- **Referral credit.** Off until staff set an amount: `GET|PUT /v1/admin/settings/referral` `{credit_cents}` (0 to 10000). A customer's code and link: `GET /v1/auth/referral`. A friend signs up with `ref`, confirms their email and pays for a first visit or has a first order delivered; the worker then credits both once. Credit is in USD and `POST /v1/orders` spends it automatically after the promo code and gift card; an order it covers fully is paid at once. An unpaid order gives it back. LogaLuxe funds it: sellers are paid in full.
+- **Sold counts** are real: units in paid shop orders plus units sold at the desk.
+- **Distance** is worked out in the visitor's browser from their own position and is never sent to the API.
+- Not built: order updates on WhatsApp.
+- Test: `node scripts/e2e/customer-extras.js`.
+
 ### Launch safety
 
 - **Customers confirm their email.** Sign-up emails a link to `/verify?token=` (48 hours). `POST /v1/auth/verify` `{token}` confirms the address the link was sent to; `POST /v1/auth/verify/send` sends it again, at most every two minutes. `user.email_verified` is in every account answer. Reviews of a business or a product need a confirmed email. Using a password reset link also confirms it.

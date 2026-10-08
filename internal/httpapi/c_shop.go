@@ -110,7 +110,7 @@ func (s *Server) getProduct(w http.ResponseWriter, r *http.Request) {
 			can = M{"review": true, "why": ""}
 		}
 	}
-	writeJSON(w, 200, M{"product": p, "photos": photos, "related": related, "reviews": reviews, "can": can})
+	writeJSON(w, 200, M{"product": p, "photos": photos, "related": related, "reviews": reviews, "can": can, "extras": s.productExtras(ctx, fmt.Sprint(p["slug"]), s.customerID(r))})
 }
 
 // POST /v1/auth/products/{slug}/review   {rating, body}   only someone who bought it, once
@@ -167,6 +167,7 @@ func (s *Server) settleOrder(ctx context.Context, orderID string) {
 	if done {
 		return
 	}
+	s.orderPlaced(orderID)
 	_, _ = q.Exec(ctx, `insert into ledger (business_id, kind, amount_cents, currency, method, status, in_balance, order_id, description, settles_at)
 		select sh.business_id, 'charge', sh.items_cents + sh.shipping_cents, b.currency, 'card', 'pending', true, sh.order_id, 'Shop order · ' || o.customer_name, now() + interval '`+settleAfter+`'
 		from order_shipments sh join businesses b on b.id = sh.business_id join orders o on o.id = sh.order_id where sh.order_id=$1 and sh.items_cents > 0`, orderID)
@@ -187,6 +188,8 @@ func (s *Server) unwindOrder(ctx context.Context, orderID string) {
 		where t.order_id=$1 and t.amount_cents < 0 and not exists (select 1 from gift_card_txns r where r.order_id=$1 and r.amount_cents > 0)`, orderID); err == nil && tag.RowsAffected() > 0 {
 		_, _ = s.pool.Exec(ctx, `update gift_cards g set balance_cents = g.balance_cents + t.amount_cents from gift_card_txns t where t.order_id=$1 and t.amount_cents > 0 and g.id = t.gift_card_id`, orderID)
 	}
+	_, _ = s.pool.Exec(ctx, `insert into user_credits (user_id, amount_cents, reason, order_id) select c.user_id, -c.amount_cents, 'Returned: the order was not paid', c.order_id from user_credits c
+		where c.order_id=$1 and c.amount_cents < 0 and not exists (select 1 from user_credits r where r.order_id=$1 and r.amount_cents > 0)`, orderID)
 	_, _ = s.pool.Exec(ctx, `update promo_codes p set used = greatest(p.used - 1, 0) from orders o where o.id=$1 and o.promo_code <> '' and upper(p.code) = upper(o.promo_code)`, orderID)
 }
 
@@ -222,7 +225,7 @@ func (s *Server) mOrders(w http.ResponseWriter, r *http.Request) {
 	if filter == "" {
 		filter = "true"
 	}
-	out, err := rows(ctx, s.pool, `select sh.id, sh.order_id, sh.fulfilment, sh.status, sh.items_cents, sh.shipping_cents, sh.tracking, sh.updated_at, o.customer_name, o.customer_phone, o.customer_email, o.status as order_status, o.created_at,
+	out, err := rows(ctx, s.pool, `select sh.id, sh.order_id, sh.fulfilment, sh.status, sh.items_cents, sh.shipping_cents, sh.tracking, sh.note, sh.updated_at, o.customer_name, o.customer_phone, o.customer_email, o.status as order_status, o.created_at,
 		case when sh.fulfilment = 'ship' then o.address end as address,
 		(select coalesce(json_agg(json_build_object('name', oi.name, 'size', oi.size_label, 'qty', oi.qty, 'unit_cents', oi.unit_cents) order by oi.name), '[]') from order_items oi where oi.order_id = o.id and oi.seller_name = sh.seller_name) as items,
 		(select coalesce(sum(l.amount_cents),0) from ledger l where l.order_id = o.id and l.business_id = sh.business_id)::int as net_cents
@@ -279,6 +282,9 @@ func (s *Server) mOrderAction(w http.ResponseWriter, r *http.Request) {
 		when not exists (select 1 from order_shipments sh where sh.order_id = o.id and sh.status = 'new') and exists (select 1 from order_shipments sh where sh.order_id = o.id and sh.status = 'shipped') then 'shipped'
 		when not exists (select 1 from order_shipments sh where sh.order_id = o.id and sh.status = 'new') then 'ready'
 		else o.status end where o.id=$1 and o.status in ('paid','ready','shipped')`, orderID)
+	if req.Action == "shipped" || (req.Action == "ready" && fulfilment == "pickup") {
+		s.orderStep(orderID, m.Business, req.Action, req.Tracking)
+	}
 	writeJSON(w, 200, M{"ok": true, "status": req.Action})
 }
 

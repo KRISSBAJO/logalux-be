@@ -135,7 +135,7 @@ func (s *Server) getBusiness(w http.ResponseWriter, r *http.Request) {
 	}
 	var photoCount int
 	_ = s.pool.QueryRow(ctx, `select count(*) from site_media where slot='business' and ref=$1 and active`, slug).Scan(&photoCount)
-	writeJSON(w, 200, M{"business": biz, "locations": locs, "staff": staff, "services": services, "reviews": reviews, "products": products, "display": display, "policy": policy, "saved": saved, "photo_count": photoCount})
+	writeJSON(w, 200, M{"business": biz, "locations": locs, "staff": staff, "services": services, "reviews": reviews, "products": products, "display": display, "policy": policy, "saved": saved, "photo_count": photoCount, "extras": s.bizExtras(ctx, fmt.Sprint(id))})
 }
 
 // GET /v1/businesses/{slug}/availability?date=2026-10-10&services=id,id&staff=id|any
@@ -561,6 +561,16 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		gift = total
 	}
 	total -= gift
+	// Referral credit is spent before any card is asked for.
+	credit := 0
+	buyer := s.customerID(r)
+	if buyer != nil && total > 0 {
+		_, _ = tx.Exec(ctx, `select 1 from users where id=$1 for update`, *buyer) // one order at a time may spend it
+		if credit = creditBalance(ctx, tx, *buyer); credit > total {
+			credit = total
+		}
+		total -= credit
+	}
 	promoCode, giftMask := "", ""
 	if promoID != "" {
 		promoCode = strings.ToUpper(strings.TrimSpace(req.PromoCode))
@@ -577,6 +587,16 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	if uid := s.customerID(r); uid != nil {
 		if _, err := tx.Exec(ctx, `update orders set user_id=$2 where id=$1`, orderID, *uid); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if buyer != nil && credit > 0 {
+		if _, err := tx.Exec(ctx, `update orders set credit_cents=$2 where id=$1`, orderID, credit); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if _, err := tx.Exec(ctx, `insert into user_credits (user_id, amount_cents, reason, order_id) values ($1,$2,'Spent on an order',$3)`, *buyer, -credit, orderID); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -604,7 +624,11 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for seller, t := range bySeller {
-		if _, err := tx.Exec(ctx, `insert into order_shipments (order_id, seller_name, business_id, fulfilment, items_cents, shipping_cents) values ($1,$2,$3,$4,$5,$6)`, orderID, seller, t.businessID, fulfilOf(seller), t.items, t.shipping); err != nil {
+		note := ""
+		if buyer != nil && t.businessID != nil && fulfilOf(seller) == "pickup" {
+			note = s.pickupNote(ctx, tx, *buyer, *t.businessID)
+		}
+		if _, err := tx.Exec(ctx, `insert into order_shipments (order_id, seller_name, business_id, fulfilment, items_cents, shipping_cents, note) values ($1,$2,$3,$4,$5,$6,$7)`, orderID, seller, t.businessID, fulfilOf(seller), t.items, t.shipping, note); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

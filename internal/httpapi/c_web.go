@@ -178,7 +178,8 @@ func (s *Server) businessReviews(w http.ResponseWriter, r *http.Request) {
 	}
 	stars, _ := strconv.Atoi(q.Get("stars"))
 	const per = 10
-	out, err := rows(ctx, s.pool, `select id, author_name, service_name, rating, body, reply, pinned, created_at, count(*) over() as total from reviews
+	out, err := rows(ctx, s.pool, `select id, author_name, service_name, rating, body, reply, pinned, created_at, count(*) over() as total,
+		(select coalesce(json_agg(sm.id order by sm.sort, sm.created_at), '[]') from site_media sm where sm.slot='review' and sm.ref = reviews.id::text and sm.active) as photos from reviews
 		where business_id=$1 and status='published' and ($2 = 0 or rating = $2) order by pinned desc, created_at desc limit $3 offset $4`, id, stars, per, (page-1)*per)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -418,7 +419,7 @@ func (s *Server) authWallet(w http.ResponseWriter, r *http.Request) {
 		out = append(out, M{"business": cl["business"], "slug": cl["slug"], "currency": cl["currency"], "tone": cl["tone"], "plans": active, "member": member,
 			"points": points, "points_value_cents": points * rules.PointValue, "min_redeem": rules.MinRedeem})
 	}
-	writeJSON(w, 200, M{"wallet": out})
+	writeJSON(w, 200, M{"wallet": out, "credit_cents": creditBalance(ctx, s.pool, c.ID), "credit_currency": "USD"})
 }
 
 var _ = math.Round
