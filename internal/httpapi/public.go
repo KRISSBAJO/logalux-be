@@ -385,6 +385,9 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	if deposit == 0 || payMode != "live" {
+		s.bookingPlaced(bookingID, req.ClientEmail)
+	}
 	if deposit > 0 && payMode == "live" {
 		// The deposit is paid on the provider's page. The time is held while the client pays, and released if they do not.
 		email := strings.TrimSpace(req.ClientEmail)

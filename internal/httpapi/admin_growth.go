@@ -112,6 +112,7 @@ func (s *Server) checkoutCheck(w http.ResponseWriter, r *http.Request) {
 		Subtotal  int    `json:"subtotal_cents"`
 		PromoCode string `json:"promo_code"`
 		GiftCode  string `json:"gift_code"`
+		Business  string `json:"business_slug"` // lets a business's own code be checked for a booking with it
 	}
 	if err := readJSON(r, &req); err != nil || req.Subtotal < 0 {
 		writeErr(w, 400, "invalid request")
@@ -123,7 +124,11 @@ func (s *Server) checkoutCheck(w http.ResponseWriter, r *http.Request) {
 	if req.Currency == "" {
 		req.Currency = "USD"
 	}
-	_, discount, promoMsg := promoDiscount(r.Context(), s.pool, req.PromoCode, req.Scope, req.Currency, req.Subtotal, false, "")
+	businessID := ""
+	if req.Business != "" {
+		_ = s.pool.QueryRow(r.Context(), `select id::text from businesses where slug=$1`, req.Business).Scan(&businessID)
+	}
+	_, discount, promoMsg := promoDiscount(r.Context(), s.pool, req.PromoCode, req.Scope, req.Currency, req.Subtotal, false, businessID)
 	_, balance, giftMsg := giftBalance(r.Context(), s.pool, req.GiftCode, req.Currency, false)
 	writeJSON(w, 200, M{"discount_cents": discount, "promo_error": promoMsg, "gift_balance_cents": balance, "gift_error": giftMsg})
 }

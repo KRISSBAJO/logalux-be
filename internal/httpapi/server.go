@@ -157,6 +157,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Get("/checkout", s.mCheckout)
 			r.Post("/checkout", s.mCheckoutPay)
 			r.Post("/checkout/link", s.mCheckoutLink)
+			r.Post("/checkout/quote", s.mCheckoutQuote)
 			r.Get("/payments/{ref}", s.mPayment)
 			r.Get("/checkout/day", s.mCheckoutDay)
 			r.Get("/inbox", s.mInbox)

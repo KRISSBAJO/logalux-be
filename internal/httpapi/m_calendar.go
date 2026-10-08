@@ -66,7 +66,7 @@ func (s *Server) mCalendar(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	blocks, _ := rows(ctx, s.pool, `select id, staff_id, starts_at, ends_at, reason from calendar_blocks where business_id=$1 and starts_at < $3 and ends_at > $2 order by starts_at`, m.BusinessID, day, end)
+	blocks, _ := rows(ctx, s.pool, `select id, staff_id, starts_at, ends_at, reason, external from calendar_blocks where business_id=$1 and starts_at < $3 and ends_at > $2 order by starts_at`, m.BusinessID, day, end)
 	off, _ := rows(ctx, s.pool, `select staff_id, starts_on, ends_on, reason from time_off where business_id=$1 and status='approved' and starts_on < $3::date and ends_on >= $2::date`, m.BusinessID, day.Format("2006-01-02"), end.Format("2006-01-02"))
 	stats, _ := row(ctx, s.pool, `select count(*) as bookings,
 		coalesce(sum(total_cents),0) as expected_cents,

@@ -180,7 +180,7 @@ func (s *Server) askProvider(ctx context.Context, provider, providerID, ref stri
 // settlePayment brings one payment up to date with the provider and, the first time it is seen as
 // paid, does what the money was for. It is safe to call any number of times.
 func (s *Server) settlePayment(ctx context.Context, ref string) M {
-	p, err := row(ctx, s.pool, `select id, reference, provider, purpose, business_id, booking_id, order_id, sale_id, amount_cents, currency, status, provider_id, description, url, expires_at, problem,
+	p, err := row(ctx, s.pool, `select id, reference, provider, purpose, business_id, booking_id, order_id, sale_id, amount_cents, currency, status, provider_id, description, url, expires_at, problem, email,
 		(select slug from businesses b where b.id = payments.business_id) as business_slug from payments where reference=$1`, ref)
 	if err != nil {
 		return nil
@@ -232,6 +232,7 @@ func (s *Server) settlePayment(ctx context.Context, ref string) M {
 			select bk.business_id, 'deposit', $2, $3, 'card', 'held', bk.id, 'Deposit · ' || bk.client_name from bookings bk where bk.id=$1
 			and not exists (select 1 from ledger l where l.booking_id = bk.id and l.kind = 'deposit')`, p["booking_id"], amount, p["currency"])
 		_, _ = s.pool.Exec(ctx, `insert into payment_events (provider, kind, booking_id, amount_cents, currency, status, reference) values ($1,'deposit',$2,$3,$4,'paid',$5)`, p["provider"], p["booking_id"], amount, p["currency"], ref)
+		s.bookingPlaced(fmt.Sprint(p["booking_id"]), fmt.Sprint(p["email"]))
 	case p["purpose"] == "order":
 		_, _ = s.pool.Exec(ctx, `update orders set status='paid' where id=$1 and status='pending'`, p["order_id"])
 		s.settleOrder(ctx, fmt.Sprint(p["order_id"]))
@@ -658,4 +659,20 @@ func paystackSigned(body []byte, header, secret string) bool {
 	mac := hmac.New(sha512.New, []byte(secret))
 	mac.Write(body)
 	return header != "" && hmac.Equal([]byte(strings.ToLower(header)), []byte(hex.EncodeToString(mac.Sum(nil))))
+}
+
+// POST /v1/m/checkout/quote   the same body as a sale; nothing is charged or kept.
+// It answers what the sale would come to, so a till never has to work the total out itself.
+func (s *Server) mCheckoutQuote(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<18))
+	if err != nil {
+		writeErr(w, 400, "invalid json")
+		return
+	}
+	code, out := s.checkoutAs(r.Context(), mc(r), raw, dryRunKey{})
+	if code != 200 {
+		writeJSON(w, code, out)
+		return
+	}
+	writeJSON(w, 200, M{"quote": out})
 }

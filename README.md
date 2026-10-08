@@ -263,6 +263,14 @@ A background worker in the API process runs every minute: it settles lines whose
 
 With `SEED=true` and `MERCHANT_DEMO_PASSWORD` set, each sample business gets an owner who can sign in at `/business/signin` as `<handle>@logaluxe.test`, for example `ada@logaluxe.test` (United States) or `mnm@logaluxe.test` (Nigeria). Six weeks of sample visits, sales and payouts are loaded once. Leave the password empty in production.
 
+## Added for the mobile app
+
+- `POST /v1/m/checkout/quote` takes the same body as `POST /v1/m/checkout` and answers `{quote}` with the totals the sale would have. Nothing is kept. The till uses it so the price on screen is the price charged, promo codes included.
+- `POST /v1/checkout/check` accepts `business_slug`, so a code that belongs to one business can be checked for a booking with it.
+- `GET /v1/m/calendar` marks each block with `external` when it came from a person's own calendar.
+- A client now gets an email when a booking is confirmed or sent as a request. When a deposit is paid online, the email goes once the money has arrived.
+- `CORS_ORIGIN` must include the address the app is served from when it runs in a browser (port 8097 in development).
+
 ## Email
 
 `MAIL_PROVIDER` is `resend`, `smtp` or `log`. With `log`, or with a provider that is missing its key, messages are written to the API log and not sent, and the console says so. Email is used for password reset links, support replies, gift card codes and bulk messages. Links in emails point at `WEB_URL`. WhatsApp and SMS are not connected: a send on those channels is recorded only.
