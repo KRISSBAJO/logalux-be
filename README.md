@@ -269,6 +269,10 @@ With `SEED=true` and `MERCHANT_DEMO_PASSWORD` set, each sample business gets an 
 - `POST /v1/checkout/check` accepts `business_slug`, so a code that belongs to one business can be checked for a booking with it.
 - `GET /v1/m/calendar` marks each block with `external` when it came from a person's own calendar.
 - A client now gets an email when a booking is confirmed or sent as a request. When a deposit is paid online, the email goes once the money has arrived.
+- `GET /v1/m/staff` hides other people's pay, contact details, takings and rent from a team-member sign-in.
+- A campaign subject may use the same placeholders as its message.
+- A promo code's given-away total counts checkout sales as well as bookings.
+- Changing a business's handle keeps its logo.
 - `CORS_ORIGIN` must include the address the app is served from when it runs in a browser (port 8097 in development).
 
 ## Email

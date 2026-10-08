@@ -87,7 +87,7 @@ func (s *Server) mStorefrontUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Slug != m.Slug { // photos and shop products are filed under the handle
-		_, _ = tx.Exec(ctx, `update site_media set ref=$2 where slot='business' and ref=$1`, m.Slug, req.Slug)
+		_, _ = tx.Exec(ctx, `update site_media set ref=$2 where slot in ('business','logo') and ref=$1`, m.Slug, req.Slug)
 	}
 	_, _ = tx.Exec(ctx, `update products set seller_name=$2 where business_id=$1`, m.BusinessID, req.Name)
 	if req.Display != nil {

@@ -237,8 +237,9 @@ func (s *Server) mCampaignTest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "campaign not found")
 		return
 	}
-	body := fill(message, map[string]string{"first name": firstName(m.Name), "last service": "your last service", "booking link": strings.TrimRight(s.cfg.WebURL, "/") + "/b/" + m.Slug, "staff": firstName(m.Name), "business": m.Business, "time": "Saturday at 10:00"})
-	status, err := s.mail.Send(ctx, m.Email, firstNonEmpty(subject, "Test: a message from "+m.Business), "[Test] "+body)
+	vals := map[string]string{"first name": firstName(m.Name), "last service": "your last service", "booking link": strings.TrimRight(s.cfg.WebURL, "/") + "/b/" + m.Slug, "staff": firstName(m.Name), "business": m.Business, "time": "Saturday at 10:00"}
+	body := fill(message, vals)
+	status, err := s.mail.Send(ctx, m.Email, firstNonEmpty(fill(subject, vals), "Test: a message from "+m.Business), "[Test] "+body)
 	if err != nil {
 		writeErr(w, 502, "the test could not be sent: "+err.Error())
 		return
@@ -276,10 +277,11 @@ func (s *Server) mCampaignSend(w http.ResponseWriter, r *http.Request) {
 				}
 				name, _ := c["name"].(string)
 				last, _ := c["last_service"].(string)
-				body := fill(message, map[string]string{"first name": firstName(name), "last service": firstNonEmpty(last, "your last visit"), "booking link": link, "staff": "the team", "business": bizName, "time": ""})
+				vals := map[string]string{"first name": firstName(name), "last service": firstNonEmpty(last, "your last visit"), "booking link": link, "staff": "the team", "business": bizName, "time": ""}
+				body := fill(message, vals)
 				email, _ := c["email"].(string)
 				phone, _ := c["phone"].(string)
-				switch s.sendToClient(bg, biz, bizName, c["id"].(string), email, phone, firstNonEmpty(subject, "News from "+bizName), body, "", nil, &id, true, channel) {
+				switch s.sendToClient(bg, biz, bizName, c["id"].(string), email, phone, firstNonEmpty(fill(subject, vals), "News from "+bizName), body, "", nil, &id, true, channel) {
 				case "delivered":
 					delivered++
 				case "logged":

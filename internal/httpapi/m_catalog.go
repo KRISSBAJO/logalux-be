@@ -203,6 +203,17 @@ func (s *Server) mStaff(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	private := m.Role == "staff"
+	if private {
+		for _, st := range staff {
+			if fmt.Sprint(st["id"]) == m.StaffID {
+				continue
+			}
+			for _, k := range []string{"email", "phone", "commission_pct", "pay_type", "hourly_cents", "salary_cents", "rent_cents", "rent_period", "rent_days", "week_cents", "login_email", "login_role"} {
+				delete(st, k)
+			}
+		}
+	}
 	var locHours any
 	_ = s.pool.QueryRow(ctx, `select hours from locations where business_id=$1 and is_primary`, m.BusinessID).Scan(&locHours)
 	timeOff, _ := rows(ctx, s.pool, `select t.id, t.staff_id, st.name as staff, t.starts_on, t.ends_on, t.reason, t.status, t.created_at,
@@ -211,6 +222,9 @@ func (s *Server) mStaff(w http.ResponseWriter, r *http.Request) {
 	services, _ := rows(ctx, s.pool, `select id, name, category from services where business_id=$1 and not archived order by sort, name`, m.BusinessID)
 	rent, _ := rows(ctx, s.pool, `select rc.id, rc.staff_id, st.name as staff, st.trading_name, rc.period_start, rc.period_end, rc.amount_cents, rc.status, rc.method, rc.note, rc.paid_at
 		from rent_charges rc join staff st on st.id = rc.staff_id where rc.business_id=$1 order by (rc.status = 'due') desc, rc.period_start desc limit 60`, m.BusinessID)
+	if private {
+		rent = []M{}
+	}
 	writeJSON(w, 200, M{"staff": staff, "location_hours": locHours, "time_off": timeOff, "services": services, "week": monday.Format("2006-01-02"), "rent": rent, "permission_defaults": staffPermDefaults})
 }
 

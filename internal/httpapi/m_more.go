@@ -198,7 +198,7 @@ var promoCodeRe = regexp.MustCompile(`^[A-Z0-9]{4,20}$`)
 func (s *Server) mPromos(w http.ResponseWriter, r *http.Request) {
 	m := mc(r)
 	out, err := rows(r.Context(), s.pool, `select pc.id, pc.code, pc.description, pc.kind, pc.value, pc.currency, pc.min_cents, pc.max_uses, pc.used, pc.starts_at, pc.ends_at, pc.active, pc.created_by, pc.created_at,
-		(select coalesce(sum(bk.discount_cents),0) from bookings bk where bk.business_id=$1 and bk.promo_code = pc.code)::int + (select coalesce(sum(sa.discount_cents),0) from sales sa where sa.business_id=$1 and sa.promo_code = pc.code and sa.booking_id is null)::int as given_cents,
+		(select coalesce(sum(bk.discount_cents),0) from bookings bk where bk.business_id=$1 and bk.promo_code = pc.code)::int + (select coalesce(sum(sa.discount_cents),0) from sales sa where sa.business_id=$1 and sa.promo_code = pc.code and (sa.booking_id is null or not exists (select 1 from bookings b2 where b2.id = sa.booking_id and b2.promo_code = pc.code)))::int as given_cents,
 		(select coalesce(sum(bk.total_cents),0) from bookings bk where bk.business_id=$1 and bk.promo_code = pc.code and bk.status not in ('cancelled_client','cancelled_business','no_show'))::int as booked_cents
 		from promo_codes pc where pc.business_id=$1 order by pc.active desc, pc.created_at desc`, m.BusinessID)
 	if err != nil {
