@@ -77,8 +77,7 @@ func (s *Server) sendToClient(ctx context.Context, businessID, businessName, cli
 		if channel == "sms" {
 			status = s.sendSMS(ctx, businessID, phone, body) // really sent only when texts are switched on
 		} else {
-			status = "logged" // WhatsApp is not connected yet
-			slog.Info("message recorded, the channel is not connected", "channel", channel, "to", phone, "body", body)
+			status = s.sendWhatsApp(ctx, phone, body) // really sent only when WhatsApp is switched on
 		}
 	default:
 		channel = firstNonEmpty(channelWanted, "email")
@@ -138,7 +137,7 @@ func (s *Server) mMarketing(w http.ResponseWriter, r *http.Request) {
 		audiences[key] = M{"total": total, "email": email, "phone": phone}
 	}
 	writeJSON(w, 200, M{"kpis": kpis, "automations": autos, "campaigns": campaigns, "audiences": audiences, "cap": marketingCap,
-		"modes": M{"email": s.mail.Mode(), "whatsapp": "log", "sms": s.smsMode(m.Market)}, "booking_link": strings.TrimRight(s.cfg.WebURL, "/") + "/b/" + m.Slug})
+		"modes": M{"email": s.mail.Mode(), "whatsapp": s.whatsappMode(), "sms": s.smsMode(m.Market)}, "booking_link": strings.TrimRight(s.cfg.WebURL, "/") + "/b/" + m.Slug})
 }
 
 // PUT /v1/m/automations/{key}   {enabled, message}

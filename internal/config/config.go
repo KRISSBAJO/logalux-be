@@ -22,16 +22,16 @@ type Config struct {
 	// Drafts of replies and campaign messages. A person always reads a draft before it is sent.
 	OpenAIKey   string
 	OpenAIModel string
-	// Text messages. Nothing is sent unless SMSEnabled is true as well as the provider's keys.
-	SMSEnabled  bool
-	TwilioSID   string
-	TwilioToken string
-	TwilioFrom  string
-	TermiiKey   string
-	TermiiBase  string
-	TermiiFrom  string
-	CORSOrigins []string
-	Seed        bool
+	// Text and WhatsApp messages. Nothing is sent unless an admin switched the feature on in the console as well.
+	TwilioWhatsAppFrom string // the WhatsApp sender Twilio gave, like whatsapp:+14155238886
+	TwilioSID          string
+	TwilioToken        string
+	TwilioFrom         string
+	TermiiKey          string
+	TermiiBase         string
+	TermiiFrom         string
+	CORSOrigins        []string
+	Seed               bool
 
 	// Image storage. All four are needed, or uploads are switched off.
 	AWSRegion    string
@@ -77,7 +77,7 @@ func Load() (Config, error) {
 		WhatsAppToken:        os.Getenv("WHATSAPP_TOKEN"),
 		OpenAIKey:            os.Getenv("OPENAI_API_KEY"),
 		OpenAIModel:          os.Getenv("OPENAI_MODEL"),
-		SMSEnabled:           os.Getenv("SMS_ENABLED") == "true",
+		TwilioWhatsAppFrom:   os.Getenv("TWILIO_WHATSAPP_FROM"),
 		TwilioSID:            os.Getenv("TWILIO_ACCOUNT_SID"),
 		TwilioToken:          os.Getenv("TWILIO_AUTH_TOKEN"),
 		TwilioFrom:           os.Getenv("TWILIO_FROM_NUMBER"),

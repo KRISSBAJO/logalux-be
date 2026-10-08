@@ -190,6 +190,8 @@ type createBookingReq struct {
 	Source       string         `json:"source"`
 	PromoCode    string         `json:"promo_code"`
 	GuestName    string         `json:"guest_name"` // who is coming, when it is not the person booking
+	CardID       string         `json:"card_id"`    // pay the deposit with a card the person kept
+	SaveCard     bool           `json:"save_card"`  // keep the card they are about to pay with
 	Answers      []intakeAnswer `json:"answers"`
 }
 
@@ -390,11 +392,14 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 	}
 	if deposit > 0 && payMode == "live" {
 		// The deposit is paid on the provider's page. The time is held while the client pays, and released if they do not.
-		email := strings.TrimSpace(req.ClientEmail)
-		if uid := s.customerID(r); uid != nil && email == "" {
-			_ = s.pool.QueryRow(ctx, `select email from users where id=$1`, *uid).Scan(&email)
+		email, payer := strings.TrimSpace(req.ClientEmail), ""
+		if uid := s.customerID(r); uid != nil {
+			payer = *uid
+			if email == "" {
+				_ = s.pool.QueryRow(ctx, `select coalesce(email,'') from users where id=$1`, *uid).Scan(&email)
+			}
 		}
-		if _, _, err := s.startPayment(ctx, payStart{Provider: providerFor(fmt.Sprint(biz["market"])), Purpose: "deposit", BusinessID: fmt.Sprint(biz["id"]), BookingID: bookingID,
+		if _, _, err := s.startPayment(ctx, payStart{UserID: payer, CardID: req.CardID, KeepCard: req.SaveCard, Provider: providerFor(fmt.Sprint(biz["market"])), Purpose: "deposit", BusinessID: fmt.Sprint(biz["id"]), BookingID: bookingID,
 			Amount: deposit, Currency: fmt.Sprint(biz["currency"]), Email: email, Description: "Deposit · " + fmt.Sprint(biz["name"])}); err != nil {
 			slog.Error("deposit payment could not be started", "booking", bookingID, "err", err)
 			_, _ = s.pool.Exec(ctx, `update bookings set status='cancelled_client', cancel_reason='The payment page could not be opened' where id=$1`, bookingID)
@@ -469,6 +474,8 @@ type orderReq struct {
 	CustomerName  string `json:"customer_name"`
 	CustomerPhone string `json:"customer_phone"`
 	CustomerEmail string `json:"customer_email"`
+	CardID        string `json:"card_id"`    // pay with a card the person kept
+	SaveCard      bool   `json:"save_card"`  // keep the card they are about to pay with
 	Fulfilment    string `json:"fulfilment"` // pickup or ship, for every seller not named below
 	// How each seller's items reach the customer, by seller name. A studio's items can be collected at a visit while a brand's are shipped.
 	FulfilmentBySeller map[string]string `json:"fulfilment_by_seller"`
@@ -707,11 +714,14 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if total > 0 && s.payMode(market) == "live" {
-		email := strings.TrimSpace(req.CustomerEmail)
-		if uid := s.customerID(r); uid != nil && email == "" {
-			_ = s.pool.QueryRow(ctx, `select email from users where id=$1`, *uid).Scan(&email)
+		email, payer := strings.TrimSpace(req.CustomerEmail), ""
+		if uid := s.customerID(r); uid != nil {
+			payer = *uid
+			if email == "" {
+				_ = s.pool.QueryRow(ctx, `select coalesce(email,'') from users where id=$1`, *uid).Scan(&email)
+			}
 		}
-		if _, _, err := s.startPayment(ctx, payStart{Provider: providerFor(market), Purpose: "order", OrderID: orderID, Amount: total, Currency: currency, Email: email, Description: "LogaLuxe shop order"}); err != nil {
+		if _, _, err := s.startPayment(ctx, payStart{UserID: payer, CardID: req.CardID, KeepCard: req.SaveCard, Provider: providerFor(market), Purpose: "order", OrderID: orderID, Amount: total, Currency: currency, Email: email, Description: "LogaLuxe shop order"}); err != nil {
 			_, _ = s.pool.Exec(ctx, `update orders set status='cancelled' where id=$1`, orderID)
 			s.unwindOrder(ctx, orderID)
 			writeErr(w, 502, "the payment page could not be opened, so the order was not placed; please try again")

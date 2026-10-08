@@ -32,6 +32,10 @@ type Customer struct {
 	Phone     string `json:"phone"`
 	// False until they open the link we email at sign-up.
 	EmailVerified bool `json:"email_verified"`
+	// True once they typed a code sent to their number. Only such a number can sign in with a code.
+	PhoneVerified bool `json:"phone_verified"`
+	// How they want to hear about bookings: whatsapp, sms or email.
+	Channel string `json:"preferred_channel"`
 }
 
 func bearer(r *http.Request) string {
@@ -45,9 +49,9 @@ func (s *Server) customerFrom(ctx context.Context, token string) (Customer, bool
 	if token == "" {
 		return c, false
 	}
-	err := s.pool.QueryRow(ctx, `select u.id::text, coalesce(u.email,''), u.first_name, u.last_name, coalesce(u.phone,''), u.email_verified_at is not null
+	err := s.pool.QueryRow(ctx, `select u.id::text, coalesce(u.email,''), u.first_name, u.last_name, coalesce(u.phone,''), u.email_verified_at is not null, u.phone_verified_at is not null, u.preferred_channel
 		from user_sessions s join users u on u.id = s.user_id where s.token_hash = $1 and s.expires_at > now()`, hashToken(token)).
-		Scan(&c.ID, &c.Email, &c.FirstName, &c.LastName, &c.Phone, &c.EmailVerified)
+		Scan(&c.ID, &c.Email, &c.FirstName, &c.LastName, &c.Phone, &c.EmailVerified, &c.PhoneVerified, &c.Channel)
 	return c, err == nil
 }
 
@@ -271,7 +275,8 @@ func (s *Server) authUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "that phone number does not look right; include the country code")
 		return
 	}
-	if _, err := s.pool.Exec(r.Context(), `update users set first_name=$2, last_name=$3, phone=nullif($4,'') where id=$1`, currentCustomer(r).ID, req.FirstName, req.LastName, phone); err != nil {
+	if _, err := s.pool.Exec(r.Context(), `update users set first_name=$2, last_name=$3, phone=nullif($4,''),
+		phone_verified_at = case when coalesce(phone,'') = $4 then phone_verified_at end where id=$1`, currentCustomer(r).ID, req.FirstName, req.LastName, phone); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}

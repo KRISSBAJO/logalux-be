@@ -45,6 +45,9 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/app-return/{screen}", s.appReturn)
+		r.Get("/features", s.features)
+		r.With(s.limit("code-send", 6, 10*time.Minute)).Post("/auth/code/send", s.authCodeSend)
+		r.With(s.limit("code-verify", 30, 10*time.Minute)).Post("/auth/code/verify", s.authCodeVerify)
 		r.Get("/businesses", s.listBusinesses)
 		r.Get("/businesses/{slug}", s.getBusiness)
 		r.Get("/businesses/{slug}/availability", s.availability)
@@ -87,6 +90,11 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Post("/auth/bookings/{id}/cancel", s.authCancelBooking)
 			r.Post("/auth/bookings/{id}/review", s.authReview)
 			r.Get("/auth/threads", s.authThreads)
+			r.Get("/auth/cards", s.authCards)
+			r.Delete("/auth/cards/{id}", s.authCardDelete)
+			r.With(s.limit("code-send", 6, 10*time.Minute)).Post("/auth/phone/send", s.authPhoneSend)
+			r.Post("/auth/phone/verify", s.authPhoneVerify)
+			r.Put("/auth/channel", s.authChannel)
 			r.Get("/auth/bookings/{id}", s.authBooking)
 			r.Post("/auth/bookings/{id}/reschedule", s.authReschedule)
 			r.Get("/auth/favourites", s.authFavourites)
@@ -336,6 +344,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Post("/2fa/enable", s.admin2FAEnable)
 			r.Post("/2fa/disable", s.admin2FADisable)
 			r.Get("/promos", s.adminPromos)
+			r.Get("/features", s.adminFeatures)
 			r.Get("/gift-cards", s.adminGiftCards)
 			r.Get("/products/{id}/details", s.adminProductDetailsGet)
 			r.Get("/tax-rates", s.adminTaxRates)
@@ -391,6 +400,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Group(func(r chi.Router) {
 				r.Use(s.need("super_admin"))
 				r.Post("/fees", s.adminFeesPropose)
+				r.Put("/features/{key}", s.adminFeatureSet)
 				r.Post("/fees/decide", s.adminFeesDecide)
 				r.Put("/leads/rates", s.adminLeadRate)
 				r.Post("/flags", s.adminFlagCreate)

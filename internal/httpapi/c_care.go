@@ -459,7 +459,9 @@ func (s *Server) authBookingTip(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	c := currentCustomer(r)
 	var req struct {
-		AmountCents int `json:"amount_cents"`
+		AmountCents int    `json:"amount_cents"`
+		CardID      string `json:"card_id"`
+		SaveCard    bool   `json:"save_card"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, "invalid json")
@@ -500,9 +502,13 @@ func (s *Server) authBookingTip(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 201, M{"ok": true, "amount_cents": req.AmountCents, "currency": currency})
 		return
 	}
-	ref, link, err := s.startPayment(ctx, payStart{Provider: providerFor(market), Purpose: "tip", BusinessID: bizID, BookingID: bookingID, Amount: req.AmountCents, Currency: currency, Email: c.Email, Description: "Tip for " + staff + " · " + biz})
+	ref, link, err := s.startPayment(ctx, payStart{UserID: c.ID, CardID: req.CardID, KeepCard: req.SaveCard, Provider: providerFor(market), Purpose: "tip", BusinessID: bizID, BookingID: bookingID, Amount: req.AmountCents, Currency: currency, Email: c.Email, Description: "Tip for " + staff + " · " + biz})
 	if err != nil {
 		writeErr(w, 502, "the payment page could not be opened; nothing was charged, please try again")
+		return
+	}
+	if link == "" { // taken from a card they kept
+		writeJSON(w, 201, M{"ok": true, "amount_cents": req.AmountCents, "currency": currency, "paid": true})
 		return
 	}
 	writeJSON(w, 201, M{"ok": true, "amount_cents": req.AmountCents, "currency": currency, "payment": M{"url": link, "reference": ref}})

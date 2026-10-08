@@ -15,13 +15,24 @@ func (s *Server) bookingPlaced(bookingID, fallback string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		b, err := row(ctx, s.pool, `select bk.status, bk.starts_at, bk.client_name, bk.guest_name, bk.total_cents, bk.deposit_cents, bk.deposit_paid,
-			coalesce(nullif(bk.client_email,''), u.email, nullif(cl.email,''), '') as email,
+			coalesce(nullif(bk.client_email,''), u.email, nullif(cl.email,''), '') as email, coalesce(bk.client_phone,'') as phone, coalesce(u.preferred_channel, cl.preferred_channel, '') as prefer, bk.business_id::text as business_id,
 			b.name as business, b.slug, b.timezone, b.currency, st.name as staff,
 			coalesce((select string_agg(bi.name, ', ') from booking_items bi where bi.booking_id = bk.id), '') as services
 			from bookings bk join businesses b on b.id = bk.business_id join staff st on st.id = bk.staff_id
 			left join users u on u.id = bk.user_id left join clients cl on cl.id = bk.client_id where bk.id=$1`, bookingID)
 		if err != nil {
 			return
+		}
+		// A short word on the phone as well, when WhatsApp or texts are switched on and the person did not choose email only.
+		if st := fmt.Sprint(b["status"]); st == "confirmed" || st == "requested" {
+			if at, ok := b["starts_at"].(time.Time); ok {
+				zone, zerr := time.LoadLocation(fmt.Sprint(b["timezone"]))
+				if zerr != nil {
+					zone = time.UTC
+				}
+				word := map[bool]string{true: "You are booked at ", false: "Your request is with "}[st == "confirmed"]
+				s.tellPhone(ctx, fmt.Sprint(b["business_id"]), fmt.Sprint(b["phone"]), fmt.Sprint(b["prefer"]), word+fmt.Sprint(b["business"])+": "+at.In(zone).Format("Mon 2 Jan at 3:04 PM")+". See or change it: "+strings.TrimRight(s.cfg.WebURL, "/")+"/b/"+fmt.Sprint(b["slug"])+"/book?booking="+bookingID)
+			}
 		}
 		to := strings.TrimSpace(firstNonEmpty(fmt.Sprint(b["email"]), strings.TrimSpace(strings.ReplaceAll(fallback, "<nil>", ""))))
 		status := fmt.Sprint(b["status"])

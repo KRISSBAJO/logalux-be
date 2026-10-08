@@ -66,6 +66,10 @@ type payStart struct {
 	Currency, Email, Description                                  string
 	// Keep the card for later charges (a membership monthly renewal). The client is told on the provider page.
 	SaveCard bool
+	// The signed-in customer who is paying, when there is one. With saved cards switched on they may pay
+	// with a card they kept (CardID) or keep the one they are about to use (KeepCard).
+	UserID, CardID string
+	KeepCard       bool
 }
 
 // startPayment opens a payment page at the provider and remembers it.
@@ -75,6 +79,26 @@ func (s *Server) startPayment(ctx context.Context, p payStart) (ref, link string
 	}
 	ref = newPayRef()
 	back := strings.TrimRight(s.cfg.WebURL, "/") + "/pay/return?ref=" + ref
+	cards := p.UserID != "" && s.featureOn("saved_cards")
+	null := func(v string) any {
+		if v == "" {
+			return nil
+		}
+		return v
+	}
+	if cards && p.CardID != "" {
+		// One tap: the money is taken from the kept card here and now. If the bank wants more, the page opens as usual.
+		if chargeID, ok := s.chargeSaved(ctx, p, ref); ok {
+			if _, err = s.pool.Exec(ctx, `insert into payments (reference, provider, purpose, business_id, booking_id, order_id, payload, merchant_id, amount_cents, currency, email, description, provider_id, url, save_card, user_id)
+				values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,'',false,$14)`, ref, p.Provider, p.Purpose, null(p.BusinessID), null(p.BookingID), null(p.OrderID), null(string(p.Payload)), null(p.MerchantID), p.Amount, p.Currency, p.Email, p.Description, chargeID, p.UserID); err != nil {
+				return "", "", err
+			}
+			s.settlePayment(ctx, ref)
+			return ref, "", nil
+		}
+		ref = newPayRef() // the provider has seen the first reference; the page gets its own
+		back = strings.TrimRight(s.cfg.WebURL, "/") + "/pay/return?ref=" + ref
+	}
 	// Paystack needs an address it accepts, so a guest, or an address on a reserved test domain, gets a stand-in. Receipts to it go nowhere.
 	if lower := strings.ToLower(p.Email); !mail.Valid(p.Email) || strings.HasSuffix(lower, ".test") || strings.HasSuffix(lower, ".example") || strings.HasSuffix(lower, ".invalid") || strings.HasSuffix(lower, ".localhost") {
 		p.Email = "client+" + ref + "@logaxp.com"
@@ -99,6 +123,17 @@ func (s *Server) startPayment(ctx context.Context, p payStart) (ref, link string
 			form.Set("customer_creation", "always")
 			form.Set("payment_intent_data[setup_future_usage]", "off_session")
 		}
+		if cards {
+			// The payment hangs on the person's own Stripe customer, so a card they keep can be found again.
+			if customer, cerr := s.stripeCustomer(ctx, p.UserID); cerr == nil {
+				form.Del("customer_email")
+				form.Del("customer_creation")
+				form.Set("customer", customer)
+				if p.KeepCard {
+					form.Set("payment_intent_data[setup_future_usage]", "off_session")
+				}
+			}
+		}
 		if err = providerJSON(ctx, http.MethodPost, "https://api.stripe.com/v1/checkout/sessions", s.cfg.StripeSecret, form, nil, &out); err != nil {
 			return "", "", err
 		}
@@ -120,18 +155,12 @@ func (s *Server) startPayment(ctx context.Context, p payStart) (ref, link string
 	if link == "" {
 		return "", "", errors.New("the payment provider did not return a payment page")
 	}
-	null := func(v string) any {
-		if v == "" {
-			return nil
-		}
-		return v
-	}
 	var payload any
 	if len(p.Payload) > 0 {
 		payload = string(p.Payload)
 	}
-	if _, err = s.pool.Exec(ctx, `insert into payments (reference, provider, purpose, business_id, booking_id, order_id, payload, merchant_id, amount_cents, currency, email, description, provider_id, url, save_card)
-		values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15)`, ref, p.Provider, p.Purpose, null(p.BusinessID), null(p.BookingID), null(p.OrderID), payload, null(p.MerchantID), p.Amount, p.Currency, p.Email, p.Description, providerID, link, p.SaveCard); err != nil {
+	if _, err = s.pool.Exec(ctx, `insert into payments (reference, provider, purpose, business_id, booking_id, order_id, payload, merchant_id, amount_cents, currency, email, description, provider_id, url, save_card, user_id)
+		values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, ref, p.Provider, p.Purpose, null(p.BusinessID), null(p.BookingID), null(p.OrderID), payload, null(p.MerchantID), p.Amount, p.Currency, p.Email, p.Description, providerID, link, p.SaveCard || (cards && p.KeepCard), null(p.UserID)); err != nil {
 		return "", "", err
 	}
 	return ref, link, nil
@@ -141,6 +170,22 @@ func (s *Server) startPayment(ctx context.Context, p payStart) (ref, link string
 func (s *Server) askProvider(ctx context.Context, provider, providerID, ref string, wantAmount int) (state, intent string) {
 	switch provider {
 	case "stripe":
+		if strings.HasPrefix(providerID, "pi_") { // taken from a kept card, with no payment page
+			var pi struct {
+				Status         string `json:"status"`
+				AmountReceived int    `json:"amount_received"`
+			}
+			if err := providerJSON(ctx, http.MethodGet, "https://api.stripe.com/v1/payment_intents/"+url.PathEscape(providerID), s.cfg.StripeSecret, nil, nil, &pi); err != nil {
+				return "pending", ""
+			}
+			switch {
+			case pi.Status == "succeeded" && pi.AmountReceived >= wantAmount:
+				return "paid", providerID
+			case pi.Status == "canceled" || pi.Status == "requires_payment_method":
+				return "failed", ""
+			}
+			return "pending", ""
+		}
 		var out struct {
 			Status        string `json:"status"`
 			PaymentStatus string `json:"payment_status"`
@@ -244,6 +289,9 @@ func (s *Server) settlePayment(ctx context.Context, ref string) M {
 	case p["purpose"] == "sale":
 		s.runPaidSale(ctx, id)
 		s.rememberCard(ctx, id) // when the sale was a membership, so next month can be charged
+	}
+	if state == "paid" {
+		s.keepCard(ctx, id) // when the customer asked to keep the card they paid with
 	}
 	return view()
 }
