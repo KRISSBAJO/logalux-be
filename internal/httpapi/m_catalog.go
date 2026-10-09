@@ -220,7 +220,7 @@ func (s *Server) mStaff(w http.ResponseWriter, r *http.Request) {
 		(select count(*) from bookings bk where bk.staff_id = t.staff_id and bk.starts_at::date between t.starts_on and t.ends_on and bk.status in ('requested','confirmed')) as bookings_affected
 		from time_off t join staff st on st.id = t.staff_id where t.business_id=$1 and t.ends_on >= current_date - 14 order by (t.status = 'requested') desc, t.starts_on`, m.BusinessID)
 	services, _ := rows(ctx, s.pool, `select id, name, category from services where business_id=$1 and not archived order by sort, name`, m.BusinessID)
-	rent, rentPage, rentErr := s.historyRows(r, "rent", `select rc.id, rc.staff_id, st.name as staff, st.trading_name, rc.period_start, rc.period_end, rc.amount_cents, rc.status, rc.method, rc.note, rc.paid_at
+	rent, rentPage, rentErr := s.historyRows(r, "rent", `select rc.id, rc.staff_id, st.name as staff, st.trading_name, rc.period_start, rc.period_end, rc.amount_cents, rc.status, rc.method, rc.note, rc.paid_at, rc.payment_reference, (select p.url from payments p where p.reference=rc.payment_reference and p.status='pending') as payment_url
 		from rent_charges rc join staff st on st.id = rc.staff_id and st.business_id = rc.business_id where rc.business_id=$1 order by (rc.status = 'due') desc, rc.period_start desc`, "(status = 'due') desc, period_start desc", "period_start staff status amount_cents", m.BusinessID)
 	if rentErr != nil {
 		writeErr(w, 500, rentErr.Error())

@@ -30,7 +30,7 @@ func (s *Server) mSettings(w http.ResponseWriter, r *http.Request) {
 		from fees where market=$1 and status='approved' and effective_from <= current_date order by plan, effective_from desc`, m.Market)
 	logins, _ := rows(ctx, s.pool, `select mu.id, mu.email, mu.name, mm.role, mu.last_login_at, st.name as staff from merchant_members mm join merchant_users mu on mu.id = mm.merchant_id left join staff st on st.id = mm.staff_id
 		where mm.business_id=$1 order by (mm.role = 'owner') desc, mu.name`, m.BusinessID)
-	account, _ := row(ctx, s.pool, `select name, email, phone from merchant_users where id=$1`, m.ID)
+	account, _ := row(ctx, s.pool, `select name, email, phone, photo_id from merchant_users where id=$1`, m.ID)
 	billing, _ := row(ctx, s.pool, `select b.plan, b.plan_paid_through, b.plan_due_since, $2::int as grace_days,
 		(select f.plan_price_cents from fees f where f.market = b.market and f.plan = 'pro' and f.status = 'approved' and f.effective_from <= current_date order by f.effective_from desc limit 1) as pro_price_cents,
 		(select coalesce(sum(-l.amount_cents),0) from ledger l where l.business_id = b.id and l.kind = 'plan_fee')::int as paid_total_cents,
@@ -337,6 +337,9 @@ func (s *Server) mAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "enter your name, and a phone number with its country code")
 		return
 	}
-	_, _ = s.pool.Exec(r.Context(), `update merchant_users set name=$2, phone=coalesce(nullif($3,''), phone) where id=$1`, mc(r).ID, strings.TrimSpace(req.Name), phone)
+	if _, err := s.pool.Exec(r.Context(), `update merchant_users set name=$2, phone=nullif($3,'') where id=$1`, mc(r).ID, strings.TrimSpace(req.Name), phone); err != nil {
+		writeErr(w, 500, "Could not save profile")
+		return
+	}
 	writeJSON(w, 200, M{"ok": true})
 }

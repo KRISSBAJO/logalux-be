@@ -317,6 +317,8 @@ func (s *Server) settlePaymentLocked(ctx context.Context, ref string) M {
 		_, _ = s.pool.Exec(ctx, `update orders set status='paid' where id=$1 and status='pending'`, p["order_id"])
 		s.settleOrder(ctx, fmt.Sprint(p["order_id"]))
 		_, _ = s.pool.Exec(ctx, `insert into payment_events (provider, kind, order_id, amount_cents, currency, status, reference) values ($1,'order',$2,$3,$4,'paid',$5)`, p["provider"], p["order_id"], amount, p["currency"], ref)
+	case p["purpose"] == "rent":
+		s.paymentFailure = s.rentPaid(ctx, ref, amount, fmt.Sprint(p["currency"]))
 	case p["purpose"] == "gift":
 		s.paymentFailure = s.giftPaid(ctx, id, ref)
 	case p["purpose"] == "tip":

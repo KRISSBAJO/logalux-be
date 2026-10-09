@@ -33,6 +33,7 @@ func StartWorker(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) {
 				return
 			case <-tick.C:
 				n++
+				s.once(ctx, 7313, func(c context.Context) { s.runMobilePush(c) })
 				s.once(ctx, 7301, func(c context.Context) { s.settleLedger(c) })
 				s.once(ctx, 7302, func(c context.Context) { s.runAutomations(c) })
 				s.once(ctx, 7307, func(c context.Context) { s.sweepPayments(c) })

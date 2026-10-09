@@ -95,6 +95,8 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		r.With(s.limit("verify", 30, 10*time.Minute)).Post("/auth/verify", s.authVerify)
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireCustomer)
+			r.Post("/auth/push", s.authPush)
+			r.Delete("/auth/push", s.authPush)
 			r.Get("/auth/me", s.authMe)
 			r.With(s.limit("handoff-create", 20, 10*time.Minute)).Post("/auth/web-handoff", s.authWebHandoff)
 			r.Put("/auth/me", s.authUpdate)
@@ -157,6 +159,8 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Use(s.requireMerchant)
 
 			// Everyone on the team: the day's work.
+			r.Post("/push", s.merchantPush)
+			r.Delete("/push", s.merchantPush)
 			r.Get("/me", s.mMe)
 			r.Post("/customer-profile", s.mCustomer)
 			r.Post("/switch", s.mSwitch)
@@ -172,6 +176,8 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Post("/2fa/enable", s.m2FAEnable)
 			r.Post("/2fa/disable", s.m2FADisable)
 			r.Put("/account", s.mAccount)
+			r.Post("/account/photo", s.mProfilePhoto)
+			r.Delete("/account/photo", s.mProfilePhoto)
 			r.Get("/home", s.mHome)
 			r.Get("/calendar", s.mCalendar)
 			r.Get("/availability", s.mAvailability)
@@ -234,6 +240,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 				r.Delete("/memberships/{id}", s.mMembershipDelete)
 				r.Post("/client-plans/{id}", s.mClientPlanAction)
 				r.Post("/rent/{id}", s.mRentAction)
+				r.Post("/rent/{id}/link", s.mRentLink)
 				r.Post("/products/{id}/photo", s.mProductPhoto)
 				r.Delete("/products/{id}/photo", s.mProductPhotoDelete)
 				r.Put("/products/{id}/services", s.mProductServices)

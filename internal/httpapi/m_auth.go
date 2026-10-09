@@ -31,19 +31,21 @@ type merchantKey struct{}
 
 // Merchant is the signed-in person plus the business they are working in.
 type Merchant struct {
-	ID         string `json:"id"`
-	Email      string `json:"email"`
-	Name       string `json:"name"`
-	Role       string `json:"role"`
-	StaffID    string `json:"staff_id"`
-	BusinessID string `json:"business_id"`
-	Business   string `json:"business"`
-	Slug       string `json:"slug"`
-	Currency   string `json:"currency"`
-	Timezone   string `json:"timezone"`
-	Market     string `json:"market"`
-	Plan       string `json:"plan"`
-	Status     string `json:"status"`
+	PhotoID    *string `json:"photo_id"`
+	Phone      string  `json:"phone"`
+	ID         string  `json:"id"`
+	Email      string  `json:"email"`
+	Name       string  `json:"name"`
+	Role       string  `json:"role"`
+	StaffID    string  `json:"staff_id"`
+	BusinessID string  `json:"business_id"`
+	Business   string  `json:"business"`
+	Slug       string  `json:"slug"`
+	Currency   string  `json:"currency"`
+	Timezone   string  `json:"timezone"`
+	Market     string  `json:"market"`
+	Plan       string  `json:"plan"`
+	Status     string  `json:"status"`
 	// What the owner switched on for this team member. Managers and the owner can do everything.
 	Permissions map[string]bool `json:"permissions"`
 	Loc         *time.Location  `json:"-"`
@@ -373,6 +375,10 @@ func (s *Server) mLogout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) mMe(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	m := mc(r)
+	if err := s.pool.QueryRow(ctx, `select photo_id::text,coalesce(phone,'') from merchant_users where id=$1`, m.ID).Scan(&m.PhotoID, &m.Phone); err != nil {
+		writeErr(w, 503, "Could not load your profile")
+		return
+	}
 	businesses, err := rows(ctx, s.pool, `select b.id, b.name, b.slug, mm.role, l.name as area from merchant_members mm join businesses b on b.id = mm.business_id
 		left join locations l on l.business_id = b.id and l.is_primary where mm.merchant_id = $1 order by b.name`, m.ID)
 	if err != nil {

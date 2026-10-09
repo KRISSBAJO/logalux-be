@@ -782,10 +782,48 @@ func (s *Server) mRentAction(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "action must be paid, waive or reopen")
 		return
 	}
-	tag, err := s.pool.Exec(r.Context(), `update rent_charges set status=$3, method=$4, note=$5, paid_at = case when $3 = 'paid' then now() end where id=$1 and business_id=$2`,
-		chi.URLParam(r, "id"), m.BusinessID, status, strings.TrimSpace(req.Method), strings.TrimSpace(req.Note))
-	if err != nil || tag.RowsAffected() == 0 {
+	ctx := r.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		writeErr(w, 500, "Could not update rent")
+		return
+	}
+	defer tx.Rollback(ctx)
+	var current, method string
+	var ref *string
+	if err = tx.QueryRow(ctx, `select status,method,payment_reference from rent_charges where id=$1 and business_id=$2 for update`, chi.URLParam(r, "id"), m.BusinessID).Scan(&current, &method, &ref); err != nil {
 		writeErr(w, 404, "rent charge not found")
+		return
+	}
+	if method == "stripe" || method == "paystack" {
+		writeErr(w, 409, "Online rent payments cannot be manually reopened or overwritten")
+		return
+	}
+	if ref != nil {
+		var state string
+		if err = tx.QueryRow(ctx, `select status from payments where reference=$1`, *ref).Scan(&state); err != nil {
+			writeErr(w, 500, "Could not check payment")
+			return
+		}
+		if state == "pending" || state == "paid" {
+			writeErr(w, 409, "An online payment is outstanding. Do not also record cash or waive this period.")
+			return
+		}
+	}
+	if req.Action == "paid" && current != "due" {
+		writeErr(w, 409, "This rental period is already settled")
+		return
+	}
+	if req.Action == "paid" && req.Method != "cash" && req.Method != "transfer" && req.Method != "card" && req.Method != "other" {
+		writeErr(w, 400, "Choose how the rent was received")
+		return
+	}
+	if _, err = tx.Exec(ctx, `update rent_charges set status=$3,method=$4,note=$5,paid_at=case when $3='paid' then now() end where id=$1 and business_id=$2`, chi.URLParam(r, "id"), m.BusinessID, status, strings.TrimSpace(req.Method), strings.TrimSpace(req.Note)); err != nil {
+		writeErr(w, 500, "Could not update rent")
+		return
+	}
+	if err = tx.Commit(ctx); err != nil {
+		writeErr(w, 500, "Could not save rent")
 		return
 	}
 	writeJSON(w, 200, M{"ok": true})
