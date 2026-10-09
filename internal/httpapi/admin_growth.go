@@ -264,6 +264,9 @@ func (s *Server) adminPromoDelete(w http.ResponseWriter, r *http.Request) {
 
 // ---------- gift cards ----------
 
+// The most ops may put on one card; above it a super admin must issue the card. The console prints it from here.
+var giftCardMaxCents = map[string]int{"USD": 50000, "NGN": 75000000} // 500 USD or 750,000 NGN
+
 // GET /v1/admin/gift-cards?q=
 func (s *Server) adminGiftCards(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -284,7 +287,7 @@ func (s *Server) adminGiftCards(w http.ResponseWriter, r *http.Request) {
 	}
 	totals, _ := rows(ctx, s.pool, `select currency, count(*) as n, coalesce(sum(initial_cents),0) as issued_cents, coalesce(sum(balance_cents) filter (where status='active'),0) as outstanding_cents from gift_cards group by currency order by currency`)
 	txns, _ := rows(ctx, s.pool, `select t.id, t.amount_cents, t.note, t.actor, t.created_at, t.order_id, g.code, g.currency from gift_card_txns t join gift_cards g on g.id = t.gift_card_id order by t.created_at desc limit 40`)
-	writeJSON(w, 200, M{"cards": out, "totals": totals, "txns": txns, "mail_mode": s.mail.Mode()})
+	writeJSON(w, 200, M{"cards": out, "totals": totals, "txns": txns, "mail_mode": s.mail.Mode(), "max_cents": giftCardMaxCents})
 }
 
 // POST /v1/admin/gift-cards
@@ -306,7 +309,7 @@ func (s *Server) adminGiftCardIssue(w http.ResponseWriter, r *http.Request) {
 	if req.Currency == "" {
 		req.Currency = "USD"
 	}
-	limit := map[string]int{"USD": 50000, "NGN": 75000000}[req.Currency] // 500 USD or 750,000 NGN a card
+	limit := giftCardMaxCents[req.Currency]
 	expires, okDate := day(req.ExpiresOn, false)
 	req.RecipientEmail = strings.TrimSpace(req.RecipientEmail)
 	switch {

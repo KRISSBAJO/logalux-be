@@ -30,6 +30,9 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request) {
 		  (select count(*) from disputes where status='needs_decision') as overdue_disputes,
 		  (select count(*) from payment_events where status='failed') as payout_failures,
 		  (select count(*) from support_tickets where status='open') as open_tickets,
+		  (select count(*) from order_returns where status='requested' and business_id is null) as brand_returns_requested,
+		  (select count(*) from sale_refund_jobs where status='pending') + (select count(*) from order_return_refund_jobs where status='pending') as pending_refunds,
+		  (select count(*) from campaigns where status='stalled') as stalled_campaigns,
 		  (select round(100.0 * count(*) filter (where status in ('simulated','succeeded')) / greatest(count(*),1), 1) from payment_events) as payment_success_pct`, market)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -233,7 +236,7 @@ func (s *Server) adminDisputeResolve(w http.ResponseWriter, r *http.Request) {
 // GET /v1/admin/businesses?q=&status=&market=
 func (s *Server) adminBusinesses(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	out, err := rows(r.Context(), s.pool, `
+	out, pagination, err := s.adminRows(r, `
 		select b.id, b.slug, b.name, b.owner_name, b.category, b.market, b.currency, b.plan, b.status, b.verification_status, b.rating, b.review_count, b.tone, b.created_at,
 		  (select count(*) from staff st where st.business_id=b.id) as staff_count,
 		  (select count(*) from bookings bk where bk.business_id=b.id and bk.created_at > now() - interval '30 days') as bookings_30d,
@@ -243,12 +246,12 @@ func (s *Server) adminBusinesses(w http.ResponseWriter, r *http.Request) {
 		from businesses b
 		where ($1='' or b.name ilike '%'||$1||'%' or b.owner_name ilike '%'||$1||'%' or b.slug ilike '%'||$1||'%')
 		  and ($2='' or b.status=$2) and ($3='' or b.market=$3)
-		order by processed_30d_cents desc`, q.Get("q"), q.Get("status"), q.Get("market"))
+		order by processed_30d_cents desc limit 200`, q.Get("q"), q.Get("status"), q.Get("market"))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"businesses": out})
+	writeJSON(w, 200, M{"pagination": pagination, "businesses": out})
 }
 
 type statusReq struct {

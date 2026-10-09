@@ -10,12 +10,14 @@ import (
 
 // The column allowlist is shared by all admin list queries; no SQL identifier comes from the URL.
 var adminSortColumns = map[string]string{
-	"bookings": " id created_at starts_at client_name business total_cents status ",
-	"clients":  " id created_at name business spent_cents bookings ",
-	"orders":   " id created_at customer_name total_cents status ",
-	"payouts":  " id scheduled_for business amount_cents status ",
-	"audit":    " id created_at actor action target ",
-	"support":  " id updated_at subject status priority ",
+	"bookings":   " id created_at starts_at client_name business total_cents status ",
+	"clients":    " id created_at name business spent_cents bookings ",
+	"orders":     " id created_at customer_name total_cents status ",
+	"payouts":    " id scheduled_for business amount_cents status ",
+	"audit":      " id created_at actor action target ",
+	"support":    " id updated_at subject status priority ",
+	"businesses": " id created_at name owner_name market status plan rating bookings_30d processed_30d_cents ",
+	"products":   " id created_at name seller_name category price_cents stock sold rating ",
 }
 
 func adminPage(r *http.Request) (page, per int) {

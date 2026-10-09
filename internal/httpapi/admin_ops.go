@@ -28,15 +28,25 @@ func (s *Server) adminHealth(w http.ResponseWriter, r *http.Request) {
 	var failedPayouts, pendingFees, lockedAdmins int
 	_ = s.pool.QueryRow(ctx, `select (select count(*) from payouts where status='failed'), (select count(*) from fees where status='pending'),
 		(select count(*) from admin_users where locked_until > now())`).Scan(&failedPayouts, &pendingFees, &lockedAdmins)
+	warnIf := func(ok bool) string { return map[bool]string{true: "ok", false: "warn"}[ok] }
+	// Texts and WhatsApp are live only when the feature is switched on and its keys are in place.
+	texts, whatsapp := s.featureOn("sms_messages"), s.featureOn("whatsapp")
+	channel := func(on bool) string {
+		if on {
+			return "live"
+		}
+		return "off"
+	}
 	checks := []M{
 		{"name": "Database", "detail": "Postgres ping", "state": state(dbErr == nil), "value": strconv.FormatInt(dbMs, 10) + " ms"},
-		{"name": "Payments", "detail": "Stripe and Paystack keys", "state": map[bool]string{true: "ok", false: "warn"}[s.cfg.PaymentsMode() == "live"], "value": s.cfg.PaymentsMode()},
-		{"name": "Messaging", "detail": "WhatsApp, SMS, email", "state": map[bool]string{true: "ok", false: "warn"}[s.cfg.MessagingMode() == "live"], "value": s.cfg.MessagingMode()},
-		{"name": "Email", "detail": "Password resets, support replies, gift cards", "state": map[bool]string{true: "ok", false: "warn"}[s.mail.Mode() != "log"], "value": map[string]string{"resend": "Resend", "smtp": "SMTP", "log": "log only"}[s.mail.Mode()]},
+		{"name": "Payments", "detail": "Stripe and Paystack keys", "state": warnIf(s.cfg.PaymentsMode() == "live"), "value": s.cfg.PaymentsMode()},
+		{"name": "Texts", "detail": "Reminders, campaign texts and inbox replies by text", "state": warnIf(texts), "value": channel(texts)},
+		{"name": "WhatsApp", "detail": "Booking confirmations and messages on WhatsApp", "state": warnIf(whatsapp), "value": channel(whatsapp)},
+		{"name": "Email", "detail": "Password resets, support replies, gift cards", "state": warnIf(s.mail.Mode() != "log"), "value": map[string]string{"relykit": "RelyKit", "resend": "Resend", "smtp": "SMTP", "log": "log only"}[s.mail.Mode()]},
 		{"name": "Image storage", "detail": "S3 bucket for site images", "state": map[bool]string{true: "ok", false: "warn"}[s.store != nil], "value": map[bool]string{true: "connected", false: "not set up"}[s.store != nil]},
-		{"name": "Payout runs", "detail": "Failed transfers waiting", "state": map[bool]string{true: "ok", false: "warn"}[failedPayouts == 0], "value": strconv.Itoa(failedPayouts) + " failed"},
-		{"name": "Fee changes", "detail": "Waiting for a second approver", "state": map[bool]string{true: "ok", false: "warn"}[pendingFees == 0], "value": strconv.Itoa(pendingFees) + " pending"},
-		{"name": "Admin accounts", "detail": "Locked after failed sign-ins", "state": map[bool]string{true: "ok", false: "warn"}[lockedAdmins == 0], "value": strconv.Itoa(lockedAdmins) + " locked"},
+		{"name": "Payout runs", "detail": "Failed transfers waiting", "state": warnIf(failedPayouts == 0), "value": strconv.Itoa(failedPayouts) + " failed"},
+		{"name": "Fee changes", "detail": "Waiting for a second approver", "state": warnIf(pendingFees == 0), "value": strconv.Itoa(pendingFees) + " pending"},
+		{"name": "Admin accounts", "detail": "Locked after failed sign-ins", "state": warnIf(lockedAdmins == 0), "value": strconv.Itoa(lockedAdmins) + " locked"},
 	}
 	writeJSON(w, 200, M{"checks": checks, "env": s.cfg.Env})
 }
@@ -46,16 +56,28 @@ func (s *Server) adminSearch(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query().Get("q")
 	if len(q) < 2 {
-		writeJSON(w, 200, M{"businesses": []M{}, "bookings": []M{}, "clients": []M{}, "disputes": []M{}, "orders": []M{}})
+		writeJSON(w, 200, M{"businesses": []M{}, "bookings": []M{}, "clients": []M{}, "disputes": []M{}, "orders": []M{}, "payments": []M{}, "tickets": []M{}, "gift_cards": []M{}})
 		return
 	}
-	biz, _ := rows(ctx, s.pool, `select id, slug, name, owner_name, market, status from businesses where name ilike '%'||$1||'%' or owner_name ilike '%'||$1||'%' or slug ilike $1||'%' or phone like '%'||$1||'%' limit 6`, q)
+	biz, _ := rows(ctx, s.pool, `select id, slug, name, owner_name, market, status, email from businesses where name ilike '%'||$1||'%' or owner_name ilike '%'||$1||'%' or slug ilike $1||'%' or phone like '%'||$1||'%' or email ilike '%'||$1||'%'
+		or exists (select 1 from merchant_members mm join merchant_users mu on mu.id = mm.merchant_id where mm.business_id = businesses.id and mu.email ilike '%'||$1||'%') limit 6`, q)
 	bks, _ := rows(ctx, s.pool, `select bk.id, bk.client_name, bk.status, bk.starts_at, b.name as business from bookings bk join businesses b on b.id=bk.business_id
 		where bk.client_name ilike '%'||$1||'%' or bk.client_phone like '%'||$1||'%' or bk.id::text ilike $1||'%' order by bk.starts_at desc limit 6`, q)
-	cls, _ := rows(ctx, s.pool, `select c.id, c.name, c.phone, b.name as business from clients c join businesses b on b.id=c.business_id where c.name ilike '%'||$1||'%' or c.phone like '%'||$1||'%' limit 6`, q)
+	cls, _ := rows(ctx, s.pool, `select c.id, c.name, c.phone, c.email, b.name as business from clients c join businesses b on b.id=c.business_id where c.name ilike '%'||$1||'%' or c.phone like '%'||$1||'%' or c.email ilike '%'||$1||'%' limit 6`, q)
 	dps, _ := rows(ctx, s.pool, `select d.id, d.ref, d.client_name, d.status, b.name as business from disputes d join businesses b on b.id=d.business_id where d.ref ilike '%'||$1||'%' or d.client_name ilike '%'||$1||'%' limit 6`, q)
-	ords, _ := rows(ctx, s.pool, `select id, customer_name, status, total_cents, created_at from orders where customer_name ilike '%'||$1||'%' or customer_phone like '%'||$1||'%' or id::text ilike $1||'%' order by created_at desc limit 6`, q)
-	writeJSON(w, 200, M{"businesses": biz, "bookings": bks, "clients": cls, "disputes": dps, "orders": ords})
+	ords, _ := rows(ctx, s.pool, `select id, customer_name, customer_email, status, total_cents, currency, created_at from orders where customer_name ilike '%'||$1||'%' or customer_phone like '%'||$1||'%' or customer_email ilike '%'||$1||'%' or id::text ilike $1||'%' order by created_at desc limit 6`, q)
+	pays, _ := rows(ctx, s.pool, `select id, provider, kind, status, reference, amount_cents, currency, booking_id, order_id, created_at from payment_events where reference <> '' and reference ilike '%'||$1||'%' order by created_at desc limit 6`, q)
+	tix, _ := rows(ctx, s.pool, `select id, ref, name, email, subject, status, updated_at from support_tickets where ref ilike '%'||$1||'%' or email ilike '%'||$1||'%' order by updated_at desc limit 6`, q)
+	cards, _ := rows(ctx, s.pool, `select id, code, recipient_name, recipient_email, balance_cents, currency, status from gift_cards where code ilike '%'||$1||'%' or recipient_email ilike '%'||$1||'%' order by created_at desc limit 6`, q)
+	// A gift card code is as good as money: only roles that can issue cards see it in full, as on the gift card page.
+	if roleRank[currentAdmin(r).Role] < roleRank["ops"] {
+		for _, c := range cards {
+			if code, ok := c["code"].(string); ok && len(code) > 4 {
+				c["code"] = "ending " + code[len(code)-4:]
+			}
+		}
+	}
+	writeJSON(w, 200, M{"businesses": biz, "bookings": bks, "clients": cls, "disputes": dps, "orders": ords, "payments": pays, "tickets": tix, "gift_cards": cards})
 }
 
 // ---------- business detail and support tools ----------
@@ -352,7 +374,7 @@ func (s *Server) adminClientBlock(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminOrders(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	out, pagination, err := s.adminRows(r, `
-		select o.id, o.customer_name, o.customer_phone, o.status, o.fulfilment, o.subtotal_cents, o.shipping_cents, o.tax_cents, o.discount_cents, o.promo_code, o.gift_cents, o.gift_code, o.total_cents, o.address, o.created_at,
+		select o.id, o.customer_name, o.customer_phone, o.status, o.fulfilment, o.subtotal_cents, o.shipping_cents, o.tax_cents, o.discount_cents, o.promo_code, o.gift_cents, o.gift_code, o.total_cents, o.currency, o.address, o.created_at,
 		  (select string_agg(oi.qty || ' × ' || oi.name || case when oi.size_label <> '' then ' (' || oi.size_label || ')' else '' end, ', ') from order_items oi where oi.order_id = o.id) as items,
 		  (select string_agg(distinct oi.seller_name, ', ') from order_items oi where oi.order_id = o.id) as sellers
 		from orders o
@@ -424,15 +446,24 @@ func (s *Server) adminOrderStatus(w http.ResponseWriter, r *http.Request) {
 
 // ---------- products ----------
 
-// GET /v1/admin/products
+// GET /v1/admin/products?q=&show=low|off&slug=
+// A product is priced in its seller's currency; brand products, which have no business behind them, are in dollars.
 func (s *Server) adminProducts(w http.ResponseWriter, r *http.Request) {
-	out, err := rows(r.Context(), s.pool, `select p.id, p.slug, p.name, p.seller_name, p.category, p.description, p.how_to_use, p.price_cents, p.compare_cents, p.stock, p.sold, p.rating, p.review_count, p.active, p.tone, p.tags, p.sizes, p.pickup, p.shipping, p.shipping_cents, b.slug as business_slug
-		from products p left join businesses b on b.id = p.business_id order by p.active desc, p.sold desc`)
+	q := r.URL.Query()
+	out, pagination, err := s.adminRows(r, `select p.id, p.slug, p.name, p.seller_name, p.category, p.description, p.how_to_use, p.price_cents, p.compare_cents, p.stock, p.sold, p.rating, p.review_count, p.active, p.tone, p.tags, p.sizes, p.pickup, p.shipping, p.shipping_cents, p.created_at,
+		b.slug as business_slug, coalesce(b.currency, 'USD') as currency
+		from products p left join businesses b on b.id = p.business_id
+		where ($1 = '' or p.name ilike '%'||$1||'%' or p.seller_name ilike '%'||$1||'%' or p.slug ilike '%'||$1||'%')
+		  and ($2 = '' or ($2 = 'off' and not p.active) or ($2 = 'low' and p.active and p.stock <= 10))
+		  and ($3 = '' or p.slug = $3)
+		order by p.active desc, p.sold desc limit 200`, q.Get("q"), q.Get("show"), q.Get("slug"))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"products": out})
+	var total int
+	_ = s.pool.QueryRow(r.Context(), `select count(*) from products`).Scan(&total)
+	writeJSON(w, 200, M{"pagination": pagination, "products": out, "total": total})
 }
 
 // POST /v1/admin/products/{id}/active  {active, reason}

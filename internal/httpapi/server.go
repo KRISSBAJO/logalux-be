@@ -343,8 +343,6 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Get("/health", s.adminHealth)
 			r.Get("/search", s.adminSearch)
 			r.Get("/verification", s.adminVerification)
-			r.Get("/verification/{id}/documents", s.adminVerificationDocs)
-			r.Get("/verification-documents/{id}", s.adminVerificationDoc)
 			r.Get("/moderation", s.adminModeration)
 			r.Get("/leads", s.adminLeads)
 			r.Get("/disputes", s.adminDisputes)
@@ -384,6 +382,10 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			// Ops: decisions that move money or change what the public sees.
 			r.Group(func(r chi.Router) {
 				r.Use(s.need("ops"))
+				// Identity documents: the papers themselves, not the queue. Support sees the queue and the decision.
+				r.Get("/verification/{id}/documents", s.adminVerificationDocs)
+				r.Get("/verification-documents/{id}", s.adminVerificationDoc)
+				r.Get("/attention", s.adminAttention)
 				r.Post("/verification/{id}/decide", s.adminVerificationDecide)
 				r.Post("/moderation/{id}/decide", s.adminModerationDecide)
 				r.Post("/disputes/{id}/resolve", s.adminDisputeResolve)
@@ -446,6 +448,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 				r.Put("/tax-rates/{region}", s.adminTaxRateSet)
 				r.Delete("/tax-rates/{region}", s.adminTaxRateSet)
 				r.Post("/returns/{id}", s.adminReturnDecide)
+				r.Post("/attention/refunds/{id}/retry", s.adminRefundRetry)
 				r.Get("/settings/referral", s.adminReferral)
 				r.Put("/settings/referral", s.adminReferralSave)
 				r.Post("/broadcasts/{id}/send", s.adminBroadcastSend)

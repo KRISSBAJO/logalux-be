@@ -185,6 +185,7 @@ func (s *Server) authReturnAsk(w http.ResponseWriter, r *http.Request) {
 
 const returnHistorySQL = `select rt.id, rt.status, rt.provider_refund_status, rt.reason, rt.note, rt.reply, rt.refund_cents, rt.credit_cents, rt.restocked, rt.created_at, rt.decided_at, rt.decided_by,
 		o.id as order_id, o.currency, greatest(rt.refund_cents - rt.credit_cents, 0) as to_card_cents, o.customer_name, o.customer_email, o.customer_phone, sh.seller_name, sh.fulfilment, sh.items_cents, sh.shipping_cents, sh.updated_at as received_at,
+		coalesce((select j.problem from order_return_refund_jobs j where j.return_id = rt.id and j.status = 'pending'), '') as refund_problem,
 		(select coalesce(json_agg(json_build_object('name', oi.name, 'size', oi.size_label, 'qty', oi.qty, 'unit_cents', oi.unit_cents) order by oi.name), '[]') from order_items oi where oi.order_id = o.id and oi.seller_name = sh.seller_name) as items
 		from order_returns rt join orders o on o.id = rt.order_id join order_shipments sh on sh.id = rt.shipment_id and sh.order_id = rt.order_id and sh.business_id is not distinct from rt.business_id
 		where (($1 = '' and rt.business_id is null) or rt.business_id::text = $1) and ($2 = '' or rt.status = $2)

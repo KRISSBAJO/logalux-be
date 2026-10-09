@@ -91,28 +91,41 @@ func (s *Server) reserveReturnRefund(ctx context.Context, id, business, actor st
 	return code, M{"ok": true, "status": "approved", "provider_refund_status": providerState, "refund_cents": refund, "to_card_cents": toCard, "credit_cents": credit}
 }
 func (s *Server) recoverReturnRefunds(ctx context.Context) {
-	jobs, err := rows(ctx, s.pool, `select return_id,payment_id,target_refunded_cents from order_return_refund_jobs where status='pending' order by target_refunded_cents,created_at limit 20`)
+	jobs, err := rows(ctx, s.pool, `select return_id from order_return_refund_jobs where status='pending' order by target_refunded_cents,created_at limit 20`)
 	if err != nil {
 		return
 	}
 	for _, j := range jobs {
-		if err = s.refundPaymentTarget(ctx, fmt.Sprint(j["payment_id"]), 0, int(toInt(j["target_refunded_cents"]))); err != nil {
-			_, _ = s.pool.Exec(ctx, `update order_return_refund_jobs set problem=$2 where return_id=$1`, j["return_id"], err.Error())
-			continue
-		}
-		tx, e := s.pool.Begin(ctx)
-		if e != nil {
-			continue
-		}
-		_, e = tx.Exec(ctx, `update order_return_refund_jobs set status='accepted',problem='' where return_id=$1`, j["return_id"])
-		if e == nil {
-			_, e = tx.Exec(ctx, `update order_returns set provider_refund_status='accepted' where id=$1`, j["return_id"])
-		}
-		if e == nil {
-			e = tx.Commit(ctx)
-		}
-		if e != nil {
-			_ = tx.Rollback(ctx)
-		}
+		s.recoverReturnRefund(ctx, fmt.Sprint(j["return_id"]))
 	}
+}
+
+// recoverReturnRefund asks the provider for one reserved return refund and marks the return once it is accepted.
+// It returns the problem text, empty when the refund went through. The worker and the console's Retry now share it.
+func (s *Server) recoverReturnRefund(ctx context.Context, returnID string) string {
+	var payment string
+	var target int
+	if err := s.pool.QueryRow(ctx, `select payment_id::text, target_refunded_cents from order_return_refund_jobs where return_id::text=$1 and status='pending'`, returnID).Scan(&payment, &target); err != nil {
+		return "this refund is no longer waiting"
+	}
+	if err := s.refundPaymentTarget(ctx, payment, 0, target); err != nil {
+		_, _ = s.pool.Exec(ctx, `update order_return_refund_jobs set problem=$2 where return_id::text=$1`, returnID, err.Error())
+		return err.Error()
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err.Error()
+	}
+	_, err = tx.Exec(ctx, `update order_return_refund_jobs set status='accepted',problem='' where return_id::text=$1`, returnID)
+	if err == nil {
+		_, err = tx.Exec(ctx, `update order_returns set provider_refund_status='accepted' where id::text=$1`, returnID)
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		return err.Error()
+	}
+	return ""
 }
