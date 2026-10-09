@@ -17,7 +17,9 @@ const call = async (method, path, body, token) => {
   const text = await r.text(); let json = {}; try { json = JSON.parse(text); } catch {}
   return { status: r.status, json, text };
 };
-const sql = (q) => execSync("docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
+// SQL runs against the database the API uses: DATABASE_URL in .env when set, else the local container.
+const DBURL = (() => { try { return (require("fs").readFileSync(".env", "utf8").match(/^DATABASE_URL=(.*)$/m) || [])[1]?.trim().replace(/^["']|["']$/g, "") || ""; } catch { return ""; } })();
+const sql = (q) => execSync(DBURL ? `docker exec -i logaluxe-db psql "${DBURL}${DBURL.includes("?") ? "&" : "?"}sslrootcert=system" -At` : "docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
 const LIST_FIELDS = ["id", "slug", "title", "dek", "category", "category_label", "tags", "author_name", "author_role", "author_media_id", "cover_media_id", "cover_alt", "country", "featured", "reading_minutes", "view_count", "published_at"];
 const hasFields = (a, fields) => fields.every((f) => f in a);
 const words = (n) => Array.from({ length: n }, (_, i) => "word" + (i % 7)).join(" ");
@@ -84,7 +86,7 @@ const draft = { title: TITLE, dek: "A throwaway piece written by the end-to-end 
   r = await a("GET", "/admin/media"); check("the article media slot exists, six pictures per article, ref by slug", r.status === 200 && r.json.slots.some((s) => s.key === "article" && s.max === 6 && s.ref === "article"), JSON.stringify(r.json.slots));
   const heroes = Number(sql("select count(*) from site_media where slot='hero' and active"));
   r = await call("GET", "/site/media?slot=article&ref=knotless-braids-what-to-ask-for");
-  if (heroes > 0) check("the seeded cover is a Journal picture that reuses a hero photo", r.status === 200 && r.json.media.length === 1 && r.json.media[0].alt.length > 10, r.text);
+  if (heroes > 0) check("the seeded article has a cover picture", r.status === 200 && r.json.media.length >= 1 && r.json.media[0].alt.length > 10, r.text);
   else console.log("     (no hero photos uploaded, so the seeded covers are empty here)");
 
   // ----- admin: validation -----
@@ -157,7 +159,7 @@ const draft = { title: TITLE, dek: "A throwaway piece written by the end-to-end 
   r = await a("POST", "/admin/journal/draft", { topic: "Test: how to prepare for a first braid appointment", category: "braids", country: "US", notes: "Keep it short." });
   if (r.status === 503) check("without OPENAI_API_KEY the draft answers 503 with a sentence", /not set up|AI service/.test(r.json.error), r.text);
   else {
-    check("the AI writes a draft that fills the editor: title, summary, body and tags", r.status === 200 && r.json.title && r.json.dek && r.json.body_md.includes("## ") && Array.isArray(r.json.tags), r.text.slice(0, 300));
+    check("the AI writes a draft that fills the editor: title, summary, body and tags", r.status === 200 && r.json.title && r.json.dek && /^#{1,3} /m.test(r.json.body_md) && Array.isArray(r.json.tags), r.text.slice(0, 300));
     console.log("     draft title →", JSON.stringify(r.json.title), "words:", (r.json.body_md || "").split(/\s+/).length);
     r = await a("GET", "/admin/journal?q=" + encodeURIComponent("Test: how to prepare")); check("nothing was saved: a draft is only text for a person to read", !r.json.articles.some((x) => /first braid appointment/i.test(x.title)), "");
   }

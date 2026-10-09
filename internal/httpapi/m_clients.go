@@ -3,8 +3,8 @@ package httpapi
 import (
 	"encoding/csv"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,22 +17,25 @@ import (
 // 60 days ago and nothing is booked ahead.
 
 const clientStats = `
-	(select count(*) from bookings bk where bk.client_id = c.id and bk.status in ('completed','paid')) as visits,
-	(select coalesce(sum(bk.total_cents),0) from bookings bk where bk.client_id = c.id and bk.status in ('completed','paid')) as spent_cents,
-	(select coalesce(sum(bk.tip_cents),0) from bookings bk where bk.client_id = c.id) as tips_cents,
-	(select max(bk.starts_at) from bookings bk where bk.client_id = c.id and bk.status in ('completed','paid')) as last_visit,
-	(select min(bk.starts_at) from bookings bk where bk.client_id = c.id and bk.starts_at > now() and bk.status in ('requested','confirmed')) as next_visit`
+ (select coalesce(sum(lp.points),0) from loyalty_points lp where lp.client_id=c.id and lp.business_id=c.business_id)::int as points,
+ exists(select 1 from client_plans cp where cp.client_id=c.id and cp.business_id=c.business_id and cp.kind='membership' and cp.status='active') as active_membership,
+ exists(select 1 from client_plans cp where cp.client_id=c.id and cp.business_id=c.business_id and cp.kind='package' and cp.status='active') as active_package,
+	(select count(*) from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.status in ('completed','paid')) as visits,
+	(select coalesce(sum(bk.total_cents),0) from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.status in ('completed','paid')) as spent_cents,
+	(select coalesce(sum(bk.tip_cents),0) from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id) as tips_cents,
+	(select max(bk.starts_at) from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.status in ('completed','paid')) as last_visit,
+	(select min(bk.starts_at) from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.starts_at > now() and bk.status in ('requested','confirmed')) as next_visit`
 
-const lapsedWhere = `exists (select 1 from bookings bk where bk.client_id = c.id and bk.status in ('completed','paid'))
-	and not exists (select 1 from bookings bk where bk.client_id = c.id and bk.status in ('completed','paid') and bk.starts_at > now() - interval '60 days')
-	and not exists (select 1 from bookings bk where bk.client_id = c.id and bk.starts_at > now() and bk.status in ('requested','confirmed'))`
+const lapsedWhere = `exists (select 1 from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.status in ('completed','paid'))
+	and not exists (select 1 from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.status in ('completed','paid') and bk.starts_at > now() - interval '60 days')
+	and not exists (select 1 from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.starts_at > now() and bk.status in ('requested','confirmed'))`
 
 var clientSegments = map[string]string{
 	"":         "true",
 	"new":      "c.created_at > now() - interval '30 days'",
-	"regulars": "(select count(*) from bookings bk where bk.client_id = c.id and bk.status in ('completed','paid')) >= 3",
+	"regulars": "(select count(*) from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.status in ('completed','paid')) >= 3",
 	"lapsed":   lapsedWhere,
-	"upcoming": "exists (select 1 from bookings bk where bk.client_id = c.id and bk.starts_at > now() and bk.status in ('requested','confirmed'))",
+	"upcoming": "exists (select 1 from bookings bk where bk.client_id = c.id and bk.business_id = c.business_id and bk.starts_at > now() and bk.status in ('requested','confirmed'))",
 	"no_show":  "c.no_show_count > 0",
 	"waitlist": "'waitlist' = any(c.tags)",
 }
@@ -42,6 +45,13 @@ func (s *Server) mClients(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	m := mc(r)
 	q := r.URL.Query()
+	if q.Get("clients_page") == "" {
+		q.Set("clients_page", q.Get("page"))
+	}
+	if q.Get("clients_per_page") == "" {
+		q.Set("clients_per_page", firstNonEmpty(q.Get("per_page"), "25"))
+	}
+	r.URL.RawQuery = q.Encode()
 	seg, ok := clientSegments[q.Get("segment")]
 	if !ok {
 		seg = "true"
@@ -50,26 +60,13 @@ func (s *Server) mClients(w http.ResponseWriter, r *http.Request) {
 	if order == "" {
 		order = "last_visit desc nulls last, c.created_at desc"
 	}
-	page, _ := strconv.Atoi(q.Get("page"))
-	if page < 1 {
-		page = 1
-	}
-	const per = 25
-	out, err := rows(ctx, s.pool, `select c.id, c.name, c.phone, c.email, c.tags, c.no_show_count, c.preferred_channel, c.marketing_opt_in, c.created_at, count(*) over() as total,`+clientStats+`
-		from clients c where c.business_id=$1 and (`+seg+`)
-		  and ($2 = '' or c.name ilike '%'||$2||'%' or c.phone like '%'||$2||'%' or c.email ilike '%'||$2||'%')
-		order by `+order+` limit `+strconv.Itoa(per)+` offset $3`, m.BusinessID, strings.TrimSpace(q.Get("q")), (page-1)*per)
+	out, clientsPage, err := s.historyRows(r, "clients", `select c.id, c.name, c.phone, c.email, c.tags, c.no_show_count, c.preferred_channel, c.marketing_opt_in, c.created_at,`+clientStats+`
+ from clients c where c.business_id=$1 and (`+seg+`) and ($2 = '' or c.name ilike '%'||$2||'%' or c.phone like '%'||$2||'%' or c.email ilike '%'||$2||'%') order by `+order, strings.ReplaceAll(order, "c.", ""), "name spent_cents visits created_at last_visit", m.BusinessID, strings.TrimSpace(q.Get("q")))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	total := 0
-	for _, c := range out {
-		if n, ok := c["total"].(int64); ok {
-			total = int(n)
-		}
-		delete(c, "total")
-	}
+	total, page, per := clientsPage["total"], clientsPage["page"], clientsPage["per_page"]
 	counts, _ := row(ctx, s.pool, `select count(*) as all,
 		count(*) filter (where `+clientSegments["new"]+`) as new,
 		count(*) filter (where `+clientSegments["regulars"]+`) as regulars,
@@ -92,10 +89,14 @@ func (s *Server) mClient(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "client not found")
 		return
 	}
-	visits, _ := rows(ctx, s.pool, `select bk.id, bk.status, bk.starts_at, bk.total_cents, bk.tip_cents, st.name as staff,
+	visits, visitsPage, visitsErr := s.historyRows(r, "visits", `select bk.id, bk.status, bk.starts_at, bk.total_cents, bk.tip_cents, st.name as staff,
 		(select string_agg(name, ' + ') from booking_items where booking_id = bk.id) as services
-		from bookings bk join staff st on st.id = bk.staff_id where bk.client_id=$1 order by bk.starts_at desc limit 12`, id)
-	writeJSON(w, 200, M{"client": c, "visits": visits})
+		from bookings bk join staff st on st.id = bk.staff_id and st.business_id = bk.business_id where bk.client_id=$1 and bk.business_id=$2 order by bk.starts_at desc `, "starts_at desc", "starts_at status total_cents staff", id, m.BusinessID)
+	if visitsErr != nil {
+		writeErr(w, 500, visitsErr.Error())
+		return
+	}
+	writeJSON(w, 200, M{"client": c, "visits": visits, "visits_pagination": visitsPage})
 }
 
 type clientReq struct {
@@ -238,11 +239,12 @@ func (s *Server) mClientImport(w http.ResponseWriter, r *http.Request) {
 // GET /v1/m/clients/export
 func (s *Server) mClientExport(w http.ResponseWriter, r *http.Request) {
 	m := mc(r)
-	out, err := rows(r.Context(), s.pool, `select c.name, c.phone, c.email, c.tags, c.no_show_count, c.preferred_channel, c.marketing_opt_in, c.created_at,`+clientStats+` from clients c where c.business_id=$1 order by c.name limit 20000`, m.BusinessID)
+	out, err := s.pool.Query(r.Context(), `select c.name, c.phone, c.email, c.tags, c.no_show_count, c.preferred_channel, c.marketing_opt_in, c.created_at,`+clientStats+` from clients c where c.business_id=$1 order by c.name`, m.BusinessID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	defer out.Close()
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="clients-`+time.Now().Format("2006-01-02")+`.csv"`)
 	_, _ = w.Write([]byte("\xEF\xBB\xBF"))
@@ -250,7 +252,12 @@ func (s *Server) mClientExport(w http.ResponseWriter, r *http.Request) {
 	cols := []string{"name", "phone", "email", "tags", "visits", "spent_cents", "tips_cents", "no_show_count", "last_visit", "next_visit", "preferred_channel", "marketing_opt_in", "created_at"}
 	_ = cw.Write(cols)
 	rec := make([]string, len(cols))
-	for _, c := range out {
+	for out.Next() {
+		c, scanErr := pgx.RowToMap(out)
+		if scanErr != nil {
+			panic(http.ErrAbortHandler)
+		}
+		tidy(c)
 		for i, k := range cols {
 			if k == "tags" {
 				rec[i] = csvCell(strings.Join(toStrings(c[k]), "; "))
@@ -259,6 +266,9 @@ func (s *Server) mClientExport(w http.ResponseWriter, r *http.Request) {
 			rec[i] = csvCell(c[k])
 		}
 		_ = cw.Write(rec)
+	}
+	if out.Err() != nil {
+		panic(http.ErrAbortHandler)
 	}
 	cw.Flush()
 }

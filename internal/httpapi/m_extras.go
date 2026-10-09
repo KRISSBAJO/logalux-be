@@ -170,10 +170,14 @@ func (s *Server) mMenu(w http.ResponseWriter, r *http.Request) {
 		(select count(*) from client_plans cp where cp.membership_id = ms.id and cp.status = 'active') as members,
 		(select count(*) from client_plans cp where cp.membership_id = ms.id and cp.status = 'past_due') as past_due
 		from memberships ms where ms.business_id=$1 order by ms.active desc, ms.name`, m.BusinessID)
-	holders, _ := rows(ctx, s.pool, `select cp.id, cp.kind, cp.name, cp.status, cp.started_at, cp.expires_at, cp.renews_on, cp.client_id, c.name as client,
+	holders, holdersPage, holdersErr := s.historyRows(r, "holders", `select cp.id, cp.kind, cp.name, cp.status, cp.started_at, cp.expires_at, cp.renews_on, cp.client_id, c.name as client,
 		(select coalesce(sum(cc.total - cc.used),0) from client_credits cc where cc.plan_id = cp.id and (cc.expires_at is null or cc.expires_at > now())) as credits_left
-		from client_plans cp join clients c on c.id = cp.client_id where cp.business_id=$1 order by (cp.status in ('active','past_due')) desc, cp.started_at desc limit 200`, m.BusinessID)
-	writeJSON(w, 200, M{"resources": resources, "price_rules": rules, "packages": packages, "memberships": memberships, "holders": holders, "auto_renew": s.payMode(m.Market) == "simulation"})
+		from client_plans cp join clients c on c.id = cp.client_id and c.business_id = cp.business_id where cp.business_id=$1 and ($2 = '' or cp.kind=$2) order by (cp.status in ('active','past_due')) desc, cp.started_at desc`, "(status in ('active','past_due')) desc, started_at desc", "started_at client name kind status credits_left", m.BusinessID, r.URL.Query().Get("holders_kind"))
+	if holdersErr != nil {
+		writeErr(w, 500, holdersErr.Error())
+		return
+	}
+	writeJSON(w, 200, M{"resources": resources, "price_rules": rules, "packages": packages, "memberships": memberships, "holders": holders, "holders_pagination": holdersPage, "auto_renew": s.payMode(m.Market) == "simulation"})
 }
 
 // ---------- rooms, chairs and stations ----------
@@ -606,14 +610,16 @@ func (s *Server) deletePlan(w http.ResponseWriter, r *http.Request, pkg bool) {
 func (s *Server) mPackageDelete(w http.ResponseWriter, r *http.Request)    { s.deletePlan(w, r, true) }
 func (s *Server) mMembershipDelete(w http.ResponseWriter, r *http.Request) { s.deletePlan(w, r, false) }
 
-// clientPlans lists what one client holds, with the credits that can still be used.
-func (s *Server) clientPlans(ctx context.Context, businessID, clientID string) (plans []M, member M) {
-	plans, _ = rows(ctx, s.pool, `select cp.id, cp.kind, cp.name, cp.status, cp.price_cents, cp.started_at, cp.expires_at, cp.renews_on, cp.package_id, cp.membership_id, (cp.pay_method <> '') as card_on_file, cp.charge_problem,
+const clientPlansHistorySQL = `select cp.id, cp.kind, cp.name, cp.status, cp.price_cents, cp.started_at, cp.expires_at, cp.renews_on, cp.package_id, cp.membership_id, (cp.pay_method <> '') as card_on_file, cp.charge_problem,
 		ms.service_discount_pct, ms.retail_discount_pct,
 		(select coalesce(json_agg(json_build_object('id', cc.id, 'service_id', cc.service_id, 'service', cc.service_name, 'total', cc.total, 'used', cc.used, 'left', cc.total - cc.used,
 			'expires_at', cc.expires_at, 'usable', (cc.used < cc.total and (cc.expires_at is null or cc.expires_at > now()) and cp.status = 'active')) order by cc.service_name), '[]') from client_credits cc where cc.plan_id = cp.id) as credits
 		from client_plans cp left join memberships ms on ms.id = cp.membership_id
-		where cp.client_id=$1 and cp.business_id=$2 order by (cp.status in ('active','past_due')) desc, cp.started_at desc limit 40`, clientID, businessID)
+		where cp.client_id=$1 and cp.business_id=$2 order by (cp.status in ('active','past_due')) desc, cp.started_at desc`
+
+// clientPlans lists what one client holds, with the credits that can still be used.
+func (s *Server) clientPlans(ctx context.Context, businessID, clientID string) (plans []M, member M) {
+	plans, _ = rows(ctx, s.pool, clientPlansHistorySQL, clientID, businessID)
 	if plans == nil {
 		plans = []M{}
 	}
@@ -637,8 +643,14 @@ func (s *Server) mClientPlans(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "client not found")
 		return
 	}
-	plans, member := s.clientPlans(r.Context(), m.BusinessID, id)
-	writeJSON(w, 200, M{"plans": plans, "member": member, "points": pointsOf(r.Context(), s.pool, m.BusinessID, id), "loyalty": loyaltyFor(r.Context(), s.pool, m.BusinessID)})
+	plans, plansPage, err := s.historyRows(r, "plans", clientPlansHistorySQL, "(status in ('active','past_due')) desc, started_at desc", "started_at name kind status price_cents", id, m.BusinessID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	member, _ := row(r.Context(), s.pool, `select cp.name, ms.service_discount_pct, ms.retail_discount_pct from client_plans cp join memberships ms on ms.id=cp.membership_id where cp.client_id=$1 and cp.business_id=$2 and cp.kind='membership' and cp.status='active' order by ms.service_discount_pct desc, cp.id limit 1`, id, m.BusinessID)
+
+	writeJSON(w, 200, M{"plans": plans, "plans_pagination": plansPage, "member": member, "points": pointsOf(r.Context(), s.pool, m.BusinessID, id), "loyalty": loyaltyFor(r.Context(), s.pool, m.BusinessID)})
 }
 
 // POST /v1/m/client-plans/{id}   {action: cancel|reactivate}
@@ -1151,6 +1163,9 @@ func (s *Server) payroll(ctx context.Context, m Merchant, from, to time.Time) (p
 
 // notifyBusiness emails the business when its settings ask for that kind of notice. It never blocks the request.
 func (s *Server) notifyBusiness(businessID, setting, subject, body string) {
+	if s.afterPaymentCommit(func(parent *Server) { parent.notifyBusiness(businessID, setting, subject, body) }) {
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
@@ -1167,6 +1182,9 @@ func (s *Server) notifyBusiness(businessID, setting, subject, body string) {
 
 // lowStockNotice tells the business once a day about products at their reorder level.
 func (s *Server) lowStockNotice(businessID string) {
+	if s.afterPaymentCommit(func(parent *Server) { parent.lowStockNotice(businessID) }) {
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()

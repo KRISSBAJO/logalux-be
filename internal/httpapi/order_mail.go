@@ -41,6 +41,9 @@ func orderRef(o M) string { return strings.ToUpper(fmt.Sprint(o["id"]))[:8] }
 
 // orderPlaced is sent once an order is paid for: what was bought, how each part reaches the customer, and where to follow it.
 func (s *Server) orderPlaced(orderID string) {
+	if s.afterPaymentCommit(func(parent *Server) { parent.orderPlaced(orderID) }) {
+		return
+	}
 	account := strings.TrimRight(s.cfg.WebURL, "/") + "/account?tab=orders"
 	s.mailOrder(orderID, "Your LogaLuxe order", func(o M, lines string) string {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

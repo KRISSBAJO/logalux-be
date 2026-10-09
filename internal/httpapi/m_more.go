@@ -127,11 +127,19 @@ func (s *Server) mLoyalty(w http.ResponseWriter, r *http.Request) {
 		(select coalesce(sum(points),0) from loyalty_points where business_id=$1 and reason='earn' and created_at > now() - interval '30 days')::int as earned_30d,
 		(select coalesce(-sum(points),0) from loyalty_points where business_id=$1 and reason='redeem' and created_at > now() - interval '30 days')::int as redeemed_30d,
 		(select count(distinct sale_id) from loyalty_points where business_id=$1 and reason='redeem' and created_at > now() - interval '30 days') as redemptions_30d`, m.BusinessID)
-	top, _ := rows(ctx, s.pool, `select c.id, c.name, c.phone, sum(lp.points)::int as points,
+	top, loyalty_clientsPage, loyalty_clientsErr := s.historyRows(r, "loyalty_clients", `select c.id, c.name, c.phone, sum(lp.points)::int as points,
 		coalesce(sum(lp.points) filter (where lp.reason='earn'),0)::int as earned, coalesce(-sum(lp.points) filter (where lp.reason='redeem'),0)::int as redeemed, max(lp.created_at) as last_at
-		from loyalty_points lp join clients c on c.id = lp.client_id where lp.business_id=$1 group by c.id having sum(lp.points) <> 0 or count(*) > 0 order by sum(lp.points) desc limit 300`, m.BusinessID)
-	recent, _ := rows(ctx, s.pool, `select lp.id, lp.points, lp.reason, lp.note, lp.actor, lp.created_at, c.name as client, lp.client_id from loyalty_points lp join clients c on c.id = lp.client_id where lp.business_id=$1 order by lp.created_at desc limit 100`, m.BusinessID)
-	writeJSON(w, 200, M{"rules": rules, "kpis": kpis, "clients": top, "recent": recent})
+		from loyalty_points lp join clients c on c.id = lp.client_id and c.business_id = lp.business_id where lp.business_id=$1 group by c.id having sum(lp.points) <> 0 or count(*) > 0 order by sum(lp.points) desc`, "points desc", "name points earned redeemed last_at", m.BusinessID)
+	if loyalty_clientsErr != nil {
+		writeErr(w, 500, loyalty_clientsErr.Error())
+		return
+	}
+	recent, recentPage, recentErr := s.historyRows(r, "recent", `select lp.id, lp.points, lp.reason, lp.note, lp.actor, lp.created_at, c.name as client, lp.client_id from loyalty_points lp join clients c on c.id = lp.client_id and c.business_id = lp.business_id where lp.business_id=$1 order by lp.created_at desc`, "created_at desc", "created_at points reason client actor", m.BusinessID)
+	if recentErr != nil {
+		writeErr(w, 500, recentErr.Error())
+		return
+	}
+	writeJSON(w, 200, M{"rules": rules, "kpis": kpis, "clients": top, "loyalty_clients_pagination": loyalty_clientsPage, "recent": recent, "recent_pagination": recentPage})
 }
 
 // PUT /v1/m/loyalty/settings   {enabled, earn_points, per_cents, point_value_cents, min_redeem}
@@ -397,13 +405,13 @@ const statementSums = `
 // GET /v1/m/statements   one line per month that had any money in it
 func (s *Server) mStatements(w http.ResponseWriter, r *http.Request) {
 	m := mc(r)
-	out, err := rows(r.Context(), s.pool, `select to_char(date_trunc('month', created_at at time zone $2), 'YYYY-MM') as month,`+statementSums+`
-		from ledger where business_id=$1 group by 1 order by 1 desc limit 36`, m.BusinessID, m.Timezone)
+	out, statementsPage, err := s.historyRows(r, "statements", `select to_char(date_trunc('month', created_at at time zone $2), 'YYYY-MM') as month,`+statementSums+`
+		from ledger where business_id=$1 group by 1 order by 1 desc `, "month desc", "month net_cents sales", m.BusinessID, m.Timezone)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"statements": out, "currency": m.Currency})
+	writeJSON(w, 200, M{"statements": out, "statements_pagination": statementsPage, "currency": m.Currency})
 }
 
 // GET /v1/m/statements/{month}?format=csv   everything that moved in one month, with the balance before and after
@@ -422,26 +430,50 @@ func (s *Server) mStatement(w http.ResponseWriter, r *http.Request) {
 	}
 	var opening, closing int
 	_ = s.pool.QueryRow(ctx, `select coalesce(sum(amount_cents) filter (where created_at < $2),0), coalesce(sum(amount_cents) filter (where created_at < $3),0) from ledger where business_id=$1 and in_balance and status <> 'held'`, m.BusinessID, from, to).Scan(&opening, &closing)
-	lines, _ := rows(ctx, s.pool, `select l.created_at, l.kind, l.description, l.method, l.amount_cents, l.status, l.in_balance, st.name as staff
-		from ledger l left join staff st on st.id = l.staff_id where l.business_id=$1 and l.created_at >= $2 and l.created_at < $3 and l.status <> 'held' order by l.created_at limit 5000`, m.BusinessID, from, to)
+
 	if r.URL.Query().Get("format") == "csv" {
+		lines, err := s.pool.Query(ctx, `select l.created_at, l.kind, l.description, l.method, l.amount_cents, l.status, l.in_balance, st.name as staff
+		from ledger l left join staff st on st.id = l.staff_id and st.business_id = l.business_id where l.business_id=$1 and l.created_at >= $2 and l.created_at < $3 and l.status <> 'held' order by l.created_at, l.id`, m.BusinessID, from, to)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		defer lines.Close()
 		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		w.Header().Set("Content-Disposition", `attachment; filename="statement-`+m.Slug+`-`+from.Format("2006-01")+`.csv"`)
 		_, _ = w.Write([]byte("\xEF\xBB\xBF"))
 		cw := csv.NewWriter(w)
 		_ = cw.Write([]string{"date", "type", "description", "method", "amount", "currency", "counts_toward_payout", "staff"})
-		for _, l := range lines {
+		for lines.Next() {
+			l, scanErr := pgx.RowToMap(lines)
+			if scanErr != nil {
+				panic(http.ErrAbortHandler)
+			}
+			tidy(l)
 			_ = cw.Write([]string{l["created_at"].(time.Time).In(m.Loc).Format("2006-01-02 15:04"), fmt.Sprint(l["kind"]), csvCell(l["description"]), fmt.Sprint(l["method"]),
 				fmt.Sprintf("%.2f", float64(toInt(l["amount_cents"]))/100), m.Currency, fmt.Sprint(l["in_balance"]), csvCell(l["staff"])})
+		}
+		if lines.Err() != nil {
+			panic(http.ErrAbortHandler)
 		}
 		cw.Flush()
 		return
 	}
+	lines, linesPage, linesErr := s.historyRows(r, "lines", `select l.id, l.created_at, l.kind, l.description, l.method, l.amount_cents, l.status, l.in_balance, st.name as staff
+		from ledger l left join staff st on st.id = l.staff_id and st.business_id = l.business_id where l.business_id=$1 and l.created_at >= $2 and l.created_at < $3 and l.status <> 'held' order by l.created_at, l.id`, "created_at asc", "created_at kind amount_cents status staff", m.BusinessID, from, to)
+	if linesErr != nil {
+		writeErr(w, 500, linesErr.Error())
+		return
+	}
 	biz, _ := row(ctx, s.pool, `select b.name, b.slug, b.market, b.plan, l.address, l.city, l.region from businesses b left join locations l on l.business_id = b.id and l.is_primary where b.id=$1`, m.BusinessID)
-	payouts, _ := rows(ctx, s.pool, `select p.amount_cents, p.fee_cents, p.status, p.kind, p.reference, p.paid_at, p.created_at, a.bank_name, a.account_last4 from payouts p left join payout_accounts a on a.id = p.account_id
-		where p.business_id=$1 and p.created_at >= $2 and p.created_at < $3 order by p.created_at`, m.BusinessID, from, to)
+	payouts, payoutsPage, payoutsErr := s.historyRows(r, "payouts", `select p.id, p.amount_cents, p.fee_cents, p.status, p.kind, p.reference, p.paid_at, p.created_at, a.bank_name, a.account_last4 from payouts p left join payout_accounts a on a.id = p.account_id and a.business_id = p.business_id
+		where p.business_id=$1 and p.created_at >= $2 and p.created_at < $3 order by p.created_at`, "created_at asc", "created_at amount_cents status kind", m.BusinessID, from, to)
+	if payoutsErr != nil {
+		writeErr(w, 500, payoutsErr.Error())
+		return
+	}
 	writeJSON(w, 200, M{"month": from.Format("2006-01"), "label": from.Format("January 2006"), "from": from.Format("2006-01-02"), "to": to.AddDate(0, 0, -1).Format("2006-01-02"),
-		"business": biz, "currency": m.Currency, "sums": sums, "opening_cents": opening, "closing_cents": closing, "lines": lines, "payouts": payouts, "payments_mode": s.payMode(m.Market)})
+		"business": biz, "currency": m.Currency, "sums": sums, "opening_cents": opening, "closing_cents": closing, "lines": lines, "lines_pagination": linesPage, "payouts": payouts, "payouts_pagination": payoutsPage, "payments_mode": s.payMode(m.Market)})
 }
 
 // ---------- the storefront logo ----------

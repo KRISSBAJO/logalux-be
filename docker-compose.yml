@@ -37,6 +37,7 @@ services:
     environment:
       PORT: 18080
       APP_ENV: ${APP_ENV:-development}
+      DATABASE_URL: ${DATABASE_URL:-}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-logaluxe}
@@ -52,6 +53,8 @@ services:
       MAIL_PROVIDER: ${MAIL_PROVIDER:-}
       MAIL_FROM: ${MAIL_FROM:-}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RELYKIT_API_KEY: ${RELYKIT_API_KEY:-}
+      RELYKIT_BASE_URL: ${RELYKIT_BASE_URL:-https://api.relykit.com}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}

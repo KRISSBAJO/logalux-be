@@ -225,7 +225,8 @@ Say only what several reviews support, including a common complaint if there is 
 // GET /v1/auth/favourites
 func (s *Server) authFavourites(w http.ResponseWriter, r *http.Request) {
 	out, err := rows(r.Context(), s.pool, `select b.slug, b.name, b.tagline, b.category, b.tone, b.rating, b.review_count, b.currency, l.name as area, l.city,
-		(select min(price_cents) from services sv where sv.business_id=b.id and sv.online and not sv.archived and sv.category <> 'Add-ons') as from_cents, f.created_at
+		(select min(price_cents) from services sv where sv.business_id=b.id and sv.online and not sv.archived and sv.category <> 'Add-ons') as from_cents, f.created_at,
+		coalesce((select sm.id from site_media sm where sm.slot='business' and sm.active and sm.ref=b.slug order by sm.sort,sm.created_at limit 1),(select sm.id from site_media sm where sm.slot='logo' and sm.active and sm.ref=b.slug limit 1)) as photo_id
 		from user_favourites f join businesses b on b.id = f.business_id left join locations l on l.business_id = b.id and l.is_primary
 		where f.user_id=$1 and b.status <> 'suspended' order by f.created_at desc`, currentCustomer(r).ID)
 	if err != nil {
@@ -295,7 +296,17 @@ func (s *Server) authBooking(w http.ResponseWriter, r *http.Request) {
 	b, err := row(ctx, s.pool, `select bk.id, bk.status, bk.starts_at, bk.ends_at, bk.total_cents, bk.discount_cents, bk.deposit_cents, bk.deposit_paid, bk.notes, bk.staff_id, bk.business_id, bk.guest_name, bk.series_id,
 		b.name as business, b.slug, b.currency, b.timezone, b.tone, st.name as staff, l.address, l.city,
 		(select coalesce(array_agg(bi.service_id::text) filter (where bi.service_id is not null), '{}') from booking_items bi where bi.booking_id = bk.id) as service_ids,
-		(select string_agg(name, ', ') from booking_items where booking_id = bk.id) as services
+		(select string_agg(name, ', ') from booking_items where booking_id = bk.id) as services,
+		coalesce((select sm.id from site_media sm where sm.slot='business' and sm.active and sm.ref=b.slug order by sm.sort,sm.created_at limit 1),(select sm.id from site_media sm where sm.slot='logo' and sm.active and sm.ref=b.slug limit 1)) as photo_id,
+		       (select case when p.refunded_cents=p.amount_cents then 'refunded' when exists(select 1 from payment_refund_jobs j where j.payment_id=p.id and j.completed_at is null) or exists(select 1 from payment_refunds rf where rf.payment_id=p.id and rf.status in ('created','sending','unknown')) then 'pending' else '' end from payments p where p.booking_id=bk.id and p.purpose='deposit' order by p.created_at desc limit 1) as refund_state,
+		       (bk.status in ('requested','confirmed') and bk.starts_at > now()) as can_cancel,
+		       (bk.status in ('completed','paid') and not exists (select 1 from reviews rv where rv.booking_id = bk.id)) as can_review,
+		       (select rv.id from reviews rv where rv.booking_id = bk.id limit 1) as review_id,
+		       (bk.status in ('paid','completed') and bk.starts_at > now() - interval '30 days') as can_tip,
+		       (select coalesce(sum(l.amount_cents),0) from ledger l where l.booking_id = bk.id and l.kind = 'tip')::int as tip_cents,
+		       (bk.starts_at < now() and bk.starts_at > now() - interval '14 days' and bk.status not like 'cancelled%' and not exists (select 1 from disputes d where d.booking_id = bk.id)) as can_report,
+		       (select json_build_object('ref', d.ref, 'status', d.status, 'outcome', d.outcome, 'outcome_cents', d.outcome_cents, 'decision_note', d.decision_note) from disputes d where d.booking_id = bk.id order by d.created_at desc limit 1) as problem,
+		       (select coalesce(json_agg(sm.id order by sm.sort, sm.created_at), '[]') from site_media sm join reviews rv on rv.id::text = sm.ref where sm.slot='review' and rv.booking_id = bk.id) as review_photos
 		from bookings bk join businesses b on b.id = bk.business_id join staff st on st.id = bk.staff_id left join locations l on l.id = bk.location_id
 		where bk.id::text=$1 and bk.user_id=$2`, chi.URLParam(r, "id"), currentCustomer(r).ID)
 	if err != nil {
@@ -395,9 +406,23 @@ func (s *Server) authReschedule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authWallet(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	c := currentCustomer(r)
-	// The business's record of this person: any client row one of their bookings is attached to, or one with their phone.
-	mine, _ := rows(ctx, s.pool, `select distinct cl.id, cl.business_id, b.name as business, b.slug, b.currency, b.tone from clients cl join businesses b on b.id = cl.business_id
-		where cl.id in (select client_id from bookings where user_id=$1 and client_id is not null) or ($2 <> '' and cl.phone = $2) order by b.name`, c.ID, c.Phone)
+	// Only a verified number proves ownership of a merchant's client record.
+	// A booking linked by a caller-supplied number must never grant wallet access.
+	mine, err := rows(ctx, s.pool, `select distinct cl.id, cl.business_id, b.name as business, b.slug, b.currency, b.tone from clients cl join businesses b on b.id = cl.business_id
+		where $1::boolean and $2 <> '' and cl.phone = $2 order by b.name`, c.PhoneVerified, c.Phone)
+	if err != nil {
+		writeErr(w, 503, "could not load your wallet; please retry")
+		return
+	}
+	balances, err := rows(ctx, s.pool, `select currency,greatest(coalesce(sum(amount_cents),0),0)::int as amount from user_credits where user_id=$1 group by currency`, c.ID)
+	if err != nil {
+		writeErr(w, 503, "could not load store credit; please retry")
+		return
+	}
+	credit := M{"USD": 0, "NGN": 0}
+	for _, balance := range balances {
+		credit[fmt.Sprint(balance["currency"])] = balance["amount"]
+	}
 	out := []M{}
 	for _, cl := range mine {
 		bizID, clientID := fmt.Sprint(cl["business_id"]), fmt.Sprint(cl["id"])
@@ -419,7 +444,7 @@ func (s *Server) authWallet(w http.ResponseWriter, r *http.Request) {
 		out = append(out, M{"business": cl["business"], "slug": cl["slug"], "currency": cl["currency"], "tone": cl["tone"], "plans": active, "member": member,
 			"points": points, "points_value_cents": points * rules.PointValue, "min_redeem": rules.MinRedeem})
 	}
-	writeJSON(w, 200, M{"wallet": out, "credit_cents": creditBalance(ctx, s.pool, c.ID), "credit_currency": "USD"})
+	writeJSON(w, 200, M{"wallet": out, "credit_cents": credit["USD"], "credit_currency": "USD", "credit_balances": credit})
 }
 
 var _ = math.Round

@@ -183,34 +183,36 @@ func (s *Server) authReturnAsk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, M{"ok": true, "id": id})
 }
 
-// returnsFor lists return requests: one business's, or (business "") the brand ones LogaLuxe staff decide.
-func (s *Server) returnsFor(ctx context.Context, businessID, status string) ([]M, error) {
-	return rows(ctx, s.pool, `select rt.id, rt.status, rt.reason, rt.note, rt.reply, rt.refund_cents, rt.credit_cents, rt.restocked, rt.created_at, rt.decided_at, rt.decided_by,
+const returnHistorySQL = `select rt.id, rt.status, rt.provider_refund_status, rt.reason, rt.note, rt.reply, rt.refund_cents, rt.credit_cents, rt.restocked, rt.created_at, rt.decided_at, rt.decided_by,
 		o.id as order_id, o.currency, greatest(rt.refund_cents - rt.credit_cents, 0) as to_card_cents, o.customer_name, o.customer_email, o.customer_phone, sh.seller_name, sh.fulfilment, sh.items_cents, sh.shipping_cents, sh.updated_at as received_at,
 		(select coalesce(json_agg(json_build_object('name', oi.name, 'size', oi.size_label, 'qty', oi.qty, 'unit_cents', oi.unit_cents) order by oi.name), '[]') from order_items oi where oi.order_id = o.id and oi.seller_name = sh.seller_name) as items
-		from order_returns rt join orders o on o.id = rt.order_id join order_shipments sh on sh.id = rt.shipment_id
+		from order_returns rt join orders o on o.id = rt.order_id join order_shipments sh on sh.id = rt.shipment_id and sh.order_id = rt.order_id and sh.business_id is not distinct from rt.business_id
 		where (($1 = '' and rt.business_id is null) or rt.business_id::text = $1) and ($2 = '' or rt.status = $2)
-		order by (rt.status = 'requested') desc, rt.created_at desc limit 300`, businessID, status)
+		order by (rt.status = 'requested') desc, rt.created_at desc`
+
+// returnsFor lists return requests: one business's, or (business "") the brand ones LogaLuxe staff decide.
+func (s *Server) returnsFor(ctx context.Context, businessID, status string) ([]M, error) {
+	return rows(ctx, s.pool, returnHistorySQL, businessID, status)
 }
 
 // GET /v1/m/returns?status=
 func (s *Server) mReturns(w http.ResponseWriter, r *http.Request) {
-	out, err := s.returnsFor(r.Context(), mc(r).BusinessID, r.URL.Query().Get("status"))
+	out, pagination, counts, selected, err := s.returnHistoryPage(r, mc(r).BusinessID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"returns": out, "reasons": returnReasons})
+	writeJSON(w, 200, M{"returns": out, "reasons": returnReasons, "returns_pagination": pagination, "counts": counts, "selected_return": selected})
 }
 
 // GET /v1/admin/returns?status=   returns of brand products
 func (s *Server) adminReturns(w http.ResponseWriter, r *http.Request) {
-	out, err := s.returnsFor(r.Context(), "", r.URL.Query().Get("status"))
+	out, pagination, counts, selected, err := s.returnHistoryPage(r, "")
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"returns": out, "reasons": returnReasons})
+	writeJSON(w, 200, M{"returns": out, "reasons": returnReasons, "returns_pagination": pagination, "counts": counts, "selected_return": selected})
 }
 
 type returnDecision struct {
@@ -245,7 +247,10 @@ func (s *Server) decideReturn(ctx context.Context, id, businessID, actor string,
 		return 409, M{"error": "this return has already been answered"}
 	}
 	if req.Action == "refuse" {
-		_, _ = s.pool.Exec(ctx, `update order_returns set status='refused', reply=$2, decided_by=$3, decided_at=now() where id=$1`, id, req.Reply, actor)
+		tag, err := s.pool.Exec(ctx, `update order_returns set status='refused', reply=$2, decided_by=$3, decided_at=now() where id=$1 and status='requested'`, id, req.Reply, actor)
+		if err != nil || tag.RowsAffected() != 1 {
+			return 409, M{"error": "this return has already been answered"}
+		}
 		s.mailOrder(orderID, "About your return", func(o M, _ string) string {
 			return "Hello,\n\n" + seller + " could not accept the return for order " + orderRef(o) + ".\n\n\"" + req.Reply + "\"\n\nIf you disagree, reply to this email or write to us from the help page.\n\nLogaLuxe"
 		})
@@ -258,71 +263,7 @@ func (s *Server) decideReturn(ctx context.Context, id, businessID, actor string,
 	if refund <= 0 || refund > items+shipping {
 		return 400, M{"error": "the refund is between " + formatMoney(1, cur) + " and " + formatMoney(items+shipping, cur) + ", what the customer paid this seller"}
 	}
-	// Claim it first, so two people pressing Approve do not both refund.
-	tag, err := s.pool.Exec(ctx, `update order_returns set status='approved', reply=$2, decided_by=$3, decided_at=now(), refund_cents=$4, restocked=$5 where id=$1 and status='requested'`, id, req.Reply, actor, refund, req.Restock)
-	if err != nil || tag.RowsAffected() == 0 {
-		return 409, M{"error": "this return has already been answered"}
-	}
-	// To the card, as far as a card paid for the order.
-	toCard, problem := 0, ""
-	var payID string
-	var paid, already int
-	if err := s.pool.QueryRow(ctx, `select id::text, amount_cents, refunded_cents from payments where order_id=$1 and purpose='order' and status in ('paid','refunded') order by paid_at desc limit 1`, orderID).Scan(&payID, &paid, &already); err == nil {
-		if toCard = refund; toCard > paid-already {
-			toCard = paid - already
-		}
-		if toCard > 0 {
-			if err := s.refundPayment(ctx, payID, toCard); err != nil {
-				problem, toCard = err.Error(), 0
-			}
-		}
-	}
-	// The rest was paid with store credit or a gift card (or in simulation): it goes back as store credit.
-	credit := refund - toCard
-	if problem != "" {
-		credit = 0
-	}
-	if credit > 0 && userID != nil {
-		_, _ = s.pool.Exec(ctx, `insert into user_credits (user_id, amount_cents, currency, reason, order_id) values ($1,$2,$4,'Refund for a return',$3)`, *userID, credit, orderID, cur)
-	} else if credit > 0 {
-		credit = 0 // a guest order has no account to hold credit; staff settle it by hand
-		problem = firstNonEmpty(problem, "part of this order was not paid by card and the customer has no account, so that part must be refunded by hand")
-	}
-	_, _ = s.pool.Exec(ctx, `update order_returns set credit_cents=$2 where id=$1`, id, credit)
-	if problem != "" {
-		_, _ = s.pool.Exec(ctx, `update order_returns set status='requested', decided_at=null, refund_cents=0, reply='' where id=$1`, id)
-		return 502, M{"error": "the refund could not be sent: " + problem + ". Nothing has changed; try again."}
-	}
-	// The seller gives the money back, and the marketplace gives back its share of the fee.
-	if bizID != nil {
-		_, _ = s.pool.Exec(ctx, `insert into ledger (business_id, kind, amount_cents, currency, method, status, in_balance, order_id, description)
-			select $1, 'refund', -$2::int, b.currency, 'card', 'settled', true, $3, 'Return · shop order' from businesses b where b.id=$1`, *bizID, refund, orderID)
-		itemPart := refund
-		if itemPart > items {
-			itemPart = items
-		}
-		_, _ = s.pool.Exec(ctx, `insert into ledger (business_id, kind, amount_cents, currency, method, status, in_balance, order_id, description)
-			select l.business_id, 'fee', round(-l.amount_cents::numeric * $3 / nullif($4,0))::int, l.currency, 'card', 'settled', true, l.order_id, 'Marketplace fee returned · shop order'
-			from ledger l where l.order_id=$2 and l.business_id=$1 and l.kind='fee' and l.amount_cents < 0 limit 1`, *bizID, orderID, itemPart, items)
-	}
-	if req.Restock {
-		_, _ = s.pool.Exec(ctx, `update products p set stock = p.stock + x.qty, sold = greatest(p.sold - x.qty, 0)
-			from (select oi.product_id, sum(oi.qty)::int as qty from order_items oi where oi.order_id=$1 and oi.seller_name=$2 group by 1) x where p.id = x.product_id`, orderID, seller)
-	}
-	how := "to the card you paid with. It can take a few days to show."
-	if toCard == 0 {
-		how = "as store credit in your LogaLuxe account."
-	} else if credit > 0 {
-		how = formatMoney(toCard, cur) + " to the card you paid with, and " + formatMoney(credit, cur) + " as store credit."
-	}
-	s.mailOrder(orderID, "Your return is approved", func(o M, _ string) string {
-		note := ""
-		if req.Reply != "" {
-			note = "\n\n\"" + req.Reply + "\""
-		}
-		return "Hello,\n\n" + seller + " approved your return for order " + orderRef(o) + ". " + formatMoney(refund, cur) + " is on its way back " + how + note + "\n\nLogaLuxe"
-	})
-	return 200, M{"ok": true, "status": "approved", "refund_cents": refund, "to_card_cents": toCard, "credit_cents": credit}
+	return s.reserveReturnRefund(ctx, id, businessID, actor, req, refund)
 }
 
 // POST /v1/m/returns/{id}   {action, reply, refund_cents, restock}
@@ -344,7 +285,7 @@ func (s *Server) adminReturnDecide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code, out := s.decideReturn(r.Context(), chi.URLParam(r, "id"), "", currentAdmin(r).Email, req)
-	if code == 200 {
+	if code == 200 || code == 202 {
 		s.audit(r, "return."+req.Action, chi.URLParam(r, "id"), nil, out)
 	}
 	writeJSON(w, code, out)
@@ -419,14 +360,23 @@ func (s *Server) authBookingProblem(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/m/problems   problems clients reported about this business's visits
 func (s *Server) mProblems(w http.ResponseWriter, r *http.Request) {
-	out, err := rows(r.Context(), s.pool, `select d.id, d.ref, d.client_name, d.amount_cents, d.currency, d.reason, d.client_statement, d.business_statement, d.status, d.outcome, d.outcome_cents, d.decision_note,
+	out, pagination, err := s.historyRows(r, "problems", `select d.id, d.ref, d.client_name, d.amount_cents, d.currency, d.reason, d.client_statement, d.business_statement, d.status, d.outcome, d.outcome_cents, d.decision_note,
 		d.business_deadline, d.created_at, d.resolved_at, bk.starts_at, (select string_agg(name, ', ') from booking_items where booking_id = bk.id) as services
-		from disputes d left join bookings bk on bk.id = d.booking_id where d.business_id=$1 order by (d.status = 'with_business') desc, d.created_at desc limit 200`, mc(r).BusinessID)
+		from disputes d left join bookings bk on bk.id = d.booking_id where d.business_id=$1 order by (d.status = 'with_business') desc, d.created_at desc`, "(status = 'with_business') desc, created_at desc", "created_at client_name status amount_cents reason", mc(r).BusinessID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"problems": out})
+	var waiting int
+	if err := s.pool.QueryRow(r.Context(), `select count(*) from disputes where business_id=$1 and status='with_business'`, mc(r).BusinessID).Scan(&waiting); err != nil {
+		writeErr(w, 503, "could not count open problems")
+		return
+	}
+	var selected M
+	if id := r.URL.Query().Get("problem"); id != "" {
+		selected, _ = row(r.Context(), s.pool, `select d.*,bk.starts_at from disputes d left join bookings bk on bk.id=d.booking_id where d.business_id=$1 and d.id::text=$2`, mc(r).BusinessID, id)
+	}
+	writeJSON(w, 200, M{"problems": out, "problems_pagination": pagination, "waiting": waiting, "selected_problem": selected})
 }
 
 // POST /v1/m/problems/{id}   {statement}   the business gives its side; the case then goes to LogaLuxe staff
@@ -581,21 +531,26 @@ func (s *Server) issueBoughtGift(ctx context.Context, g giftOrder, paymentRef st
 	if g.RecipientEmail == "" {
 		body = "Hello " + firstNonEmpty(g.BuyerName, "there") + ",\n\nHere is your " + amount + " LogaLuxe gift card.\n\nCode: " + code + "\n\nUse it at checkout in the LogaLuxe shop: " + shop + "\nWhatever is not spent stays on the card.\n\nLogaLuxe"
 	}
-	go func() {
-		c, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if !strings.HasSuffix(strings.ToLower(to), ".test") {
-			if _, err := s.mail.Send(c, to, "Your LogaLuxe gift card", body); err != nil {
-				s.logMailFailure("gift card", to, err)
+	send := func() {
+		go func() {
+			c, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if !strings.HasSuffix(strings.ToLower(to), ".test") {
+				if _, err := s.mail.Send(c, to, "Your LogaLuxe gift card", body); err != nil {
+					s.logMailFailure("gift card", to, err)
+				}
 			}
-		}
-		if g.RecipientEmail != "" && !strings.HasSuffix(strings.ToLower(g.BuyerEmail), ".test") {
-			if _, err := s.mail.Send(c, g.BuyerEmail, "Your gift card is on its way", "Hello "+firstNonEmpty(g.BuyerName, "there")+",\n\nYour "+amount+" LogaLuxe gift card has been emailed to "+g.RecipientEmail+
-				". The code is only in their email, so it stays a surprise.\n\nLogaLuxe"); err != nil {
-				s.logMailFailure("gift card receipt", g.BuyerEmail, err)
+			if g.RecipientEmail != "" && !strings.HasSuffix(strings.ToLower(g.BuyerEmail), ".test") {
+				if _, err := s.mail.Send(c, g.BuyerEmail, "Your gift card is on its way", "Hello "+firstNonEmpty(g.BuyerName, "there")+",\n\nYour "+amount+" LogaLuxe gift card has been emailed to "+g.RecipientEmail+
+					". The code is only in their email, so it stays a surprise.\n\nLogaLuxe"); err != nil {
+					s.logMailFailure("gift card receipt", g.BuyerEmail, err)
+				}
 			}
-		}
-	}()
+		}()
+	}
+	if !s.afterPaymentCommit(func(_ *Server) { send() }) {
+		send()
+	}
 	return code, nil
 }
 
@@ -672,17 +627,15 @@ func (s *Server) giftBuy(w http.ResponseWriter, r *http.Request) {
 }
 
 // giftPaid runs when a gift card's payment arrives.
-func (s *Server) giftPaid(ctx context.Context, paymentID, ref string) {
+func (s *Server) giftPaid(ctx context.Context, paymentID, ref string) error {
 	var payload []byte
 	if err := s.pool.QueryRow(ctx, `select payload from payments where id=$1`, paymentID).Scan(&payload); err != nil {
-		return
+		return err
 	}
 	var g giftOrder
 	if err := json.Unmarshal(payload, &g); err != nil {
-		_, _ = s.pool.Exec(ctx, `update payments set problem='Paid, but the gift card details could not be read' where id=$1`, paymentID)
-		return
+		return err
 	}
-	if _, err := s.issueBoughtGift(ctx, g, ref); err != nil {
-		_, _ = s.pool.Exec(ctx, `update payments set problem=$2 where id=$1`, paymentID, "Paid, but the gift card was not made: "+err.Error())
-	}
+	_, err := s.issueBoughtGift(ctx, g, ref)
+	return err
 }

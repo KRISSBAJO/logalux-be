@@ -337,6 +337,14 @@ Admin, with a staff token. Every role reads; ops and above write; only a super a
 
 Test: `node scripts/e2e/journal.js` (any mode; 82 checks, cleans up after itself) and `go test ./internal/httpapi -run 'TestArticleSlug|TestReadingMinutes|TestMediaImages'`.
 
+## Reliability
+
+- A quick sale (`POST /v1/m/checkout` without a booking) may carry a `request_id` (any id the client makes up and keeps while retrying). The same id answers with the same receipt instead of a second sale, and `POST /v1/m/checkout/receipt` recovers a receipt by it. Without one the sale is still recorded, with no protection against a repeated submit. The web till and the app send one.
+- Refunds through a provider are kept as jobs: the sale or return shows `provider_refund_status: pending` until the provider confirms, the worker retries, and a replayed refund form answers with its first result.
+- Campaigns are jobs in `campaign_jobs`: sending starts the moment a campaign is sent and the worker picks up whatever is left every minute, so a restart loses nothing; a campaign whose outcomes cannot be known is marked `stalled` with a reason.
+- Long histories (sales, ledger, statements, orders, returns, clients, loyalty, leads, reviews, memberships, rent) are paged on the server with `page` and `per_page`.
+- The end-to-end suites run their SQL against the database the API uses: `DATABASE_URL` in `.env` when set (a hosted database), else the local container.
+
 ## Email
 
 `MAIL_PROVIDER` is `resend`, `smtp` or `log`. With `log`, or with a provider that is missing its key, messages are written to the API log and not sent, and the console says so. Email is used for password reset links, support replies, gift card codes and bulk messages. Links in emails point at `WEB_URL`. WhatsApp and SMS are not connected: a send on those channels is recorded only.

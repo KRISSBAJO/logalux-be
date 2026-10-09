@@ -24,7 +24,9 @@ const upload = async (path, fields, bytes, type, name, token) => {
   const text = await r.text(); let json = {}; try { json = JSON.parse(text); } catch {}
   return { status: r.status, json, text };
 };
-const sql = (q) => execSync("docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
+// SQL runs against the database the API uses: DATABASE_URL in .env when set, else the local container.
+const DBURL = (() => { try { return (require("fs").readFileSync(".env", "utf8").match(/^DATABASE_URL=(.*)$/m) || [])[1]?.trim().replace(/^["']|["']$/g, "") || ""; } catch { return ""; } })();
+const sql = (q) => execSync(DBURL ? `docker exec -i logaluxe-db psql "${DBURL}${DBURL.includes("?") ? "&" : "?"}sslrootcert=system" -At` : "docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
 // The smallest valid PNG: one transparent pixel.
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 
@@ -82,7 +84,13 @@ const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
   check("a naira order is quoted in naira with the business's 7.5% tax", r.json.quote?.currency === "NGN" && r.json.quote.tax_cents === 37500 && r.json.quote.total_cents === 537500, r.text);
   r = await call("POST", "/orders/quote", { ...order, items: [...order.items, { product_slug: "scalp-oil", size_label: "60 ml", qty: 1 }] }, C);
   check("dollar and naira items cannot share an order", r.status === 400 && /one order for each/.test(r.text), r.text);
-  r = await call("POST", "/orders/quote", { ...order, gift_code: "LX-AAAA-BBBB-CCCC" }, C); check("a dollar gift card cannot pay for a naira order", r.status === 400 && /US dollars/.test(r.text), r.text);
+  // A dollar card issued for this run (the database has no fixed sample card).
+  const adminTok = ADMIN_EMAIL && ADMIN_PW ? (await call("POST", "/admin/login", { email: ADMIN_EMAIL, password: ADMIN_PW })).json.token : "";
+  const usdCard = adminTok ? (await call("POST", "/admin/gift-cards", { amount_cents: 2500, currency: "USD", recipient_name: "E2E Naira", recipient_email: `e2e-naira-gift-${stamp}@example.test`, note: "", expires_on: "", send_email: false }, adminTok)).json.code : "";
+  if (usdCard) {
+    r = await call("POST", "/orders/quote", { ...order, gift_code: usdCard }, C); check("a dollar gift card cannot pay for a naira order", r.status === 400 && /different currency|US dollars/.test(r.text), r.text);
+    sql(`delete from gift_cards where code='${usdCard}'`);
+  }
   sql(`insert into user_credits (user_id, amount_cents, reason) select id, 2500, 'Test credit' from users where email='${EMAIL}'`);
   r = await call("POST", "/orders/quote", order, C); check("nor is dollar store credit spent on it", r.json.quote?.credit_cents === 0 && r.json.quote.total_cents === 537500, r.text);
   r = await call("POST", "/orders", order, C); const o = r.json.order || {};

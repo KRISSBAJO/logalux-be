@@ -1,4 +1,4 @@
-// Package mail sends plain-text email through Resend or SMTP. With neither
+// Package mail sends plain-text email through RelyKit, Resend or SMTP. Without a provider
 // configured it writes the message to the log instead, so every flow that
 // sends mail still works on a developer's machine.
 package mail
@@ -20,7 +20,9 @@ import (
 )
 
 type Config struct {
-	Provider   string // resend, smtp or log
+	Provider   string // relykit, resend, smtp or log
+	RelyKitKey string
+	RelyKitURL string
 	From       string
 	ResendKey  string
 	SMTPHost   string
@@ -46,9 +48,13 @@ func New(cfg Config) *Mailer {
 	cfg.Provider = strings.ToLower(strings.TrimSpace(cfg.Provider))
 	switch {
 	case cfg.Provider == "resend" && cfg.ResendKey != "" && cfg.From != "":
+	case cfg.Provider == "relykit" && cfg.RelyKitKey != "" && cfg.From != "":
 	case cfg.Provider == "smtp" && cfg.SMTPHost != "" && cfg.From != "":
 	default:
 		cfg.Provider = "log"
+	}
+	if cfg.RelyKitURL == "" {
+		cfg.RelyKitURL = "https://api.relykit.com"
 	}
 	return &Mailer{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}, resendURL: "https://api.resend.com/emails"}
 }
@@ -56,13 +62,16 @@ func New(cfg Config) *Mailer {
 // Mode is "resend", "smtp" or "log".
 func (m *Mailer) Mode() string { return m.cfg.Provider }
 
-// Send delivers one message. The returned status is "sent" or "logged".
+// Send submits one message. Status is "queued" for RelyKit, "sent" for
+// Resend/SMTP, or "logged" without a provider. Queued does not mean delivered.
 func (m *Mailer) Send(ctx context.Context, to, subject, text string) (string, error) {
 	if !Valid(to) {
 		return "", fmt.Errorf("not an email address: %q", to)
 	}
 	subject = strings.Join(strings.Fields(subject), " ") // no line breaks in a header
 	switch m.cfg.Provider {
+	case "relykit":
+		return m.relykit(ctx, to, subject, text)
 	case "resend":
 		return "sent", m.resend(ctx, to, subject, text)
 	case "smtp":
@@ -70,6 +79,43 @@ func (m *Mailer) Send(ctx context.Context, to, subject, text string) (string, er
 	}
 	slog.Info("mail not sent, no provider is configured", "to", to, "subject", subject, "body", text)
 	return "logged", nil
+}
+
+// RelyKit queues delivery; acceptance is not a delivery confirmation.
+func (m *Mailer) relykit(ctx context.Context, to, subject, text string) (string, error) {
+	body, err := json.Marshal(map[string]any{"from": m.cfg.From, "to": []string{to}, "subject": subject, "text": text})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(m.cfg.RelyKitURL, "/")+"/emails", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+m.cfg.RelyKitKey)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := m.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("relykit request failed: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", fmt.Errorf("relykit refused email (HTTP %d)", res.StatusCode)
+	}
+	var out struct {
+		ID         string   `json:"id"`
+		Status     string   `json:"status"`
+		Suppressed []string `json:"suppressed"`
+	}
+	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&out); err != nil {
+		return "", fmt.Errorf("relykit invalid response: %w", err)
+	}
+	if out.ID == "" {
+		return "", fmt.Errorf("relykit returned no message id")
+	}
+	if out.Status == "cancelled" || out.Status == "failed" || len(out.Suppressed) > 0 {
+		return "", fmt.Errorf("relykit did not accept delivery: %s", out.Status)
+	}
+	return "queued", nil
 }
 
 func (m *Mailer) resend(ctx context.Context, to, subject, text string) error {

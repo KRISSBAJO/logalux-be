@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -48,11 +49,13 @@ func (s *Server) mCheckout(w http.ResponseWriter, r *http.Request) {
 	m := mc(r)
 	now := time.Now().In(m.Loc)
 	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, m.Loc)
+	seeAll := perm(m, "see_all_calendars")
 	queue, err := rows(ctx, s.pool, `select `+bookingCols+` from bookings bk join staff st on st.id = bk.staff_id
 		where bk.business_id=$1 and bk.paid_at is null
+		  and ($4 or bk.staff_id=nullif($5,'')::uuid)
 		  and ((bk.status in ('checked_in','in_progress','completed') and bk.starts_at > now() - interval '3 days')
 		    or (bk.status = 'confirmed' and bk.starts_at >= $2 and bk.starts_at < $3))
-		order by (bk.status = 'completed') desc, (bk.status = 'in_progress') desc, (bk.status = 'checked_in') desc, bk.starts_at`, m.BusinessID, day, day.Add(24*time.Hour))
+		order by (bk.status = 'completed') desc, (bk.status = 'in_progress') desc, (bk.status = 'checked_in') desc, bk.starts_at`, m.BusinessID, day, day.AddDate(0, 0, 1), seeAll, m.StaffID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -62,9 +65,21 @@ func (s *Server) mCheckout(w http.ResponseWriter, r *http.Request) {
 		(select coalesce(json_agg(json_build_object('location_id', ls.location_id, 'qty', ls.qty)), '[]') from location_stock ls where ls.product_id = products.id) as by_location
 		from products where business_id=$1 and kind in ('retail','both') and stock > 0 order by name`, m.BusinessID)
 	staff, _ := rows(ctx, s.pool, `select id, name, initials, tone from staff where business_id=$1 and not archived order by role='owner' desc, name`, m.BusinessID)
-	today, _ := rows(ctx, s.pool, `select sa.id, sa.client_name, sa.total_cents, sa.tip_cents, sa.method, sa.status, sa.refunded_cents, sa.created_at, st.name as staff,
+	today, salesPage, err := s.historyRows(r, "sales", `select sa.id, sa.client_name, sa.total_cents, sa.tip_cents, sa.method, sa.status, sa.provider_refund_status, (select problem from sale_refund_jobs rf where rf.sale_id=sa.id and rf.status='pending' limit 1) as refund_problem, sa.refunded_cents, sa.created_at, st.name as staff,
 		(select string_agg(si.name, ', ') from sale_items si where si.sale_id = sa.id) as items
-		from sales sa left join staff st on st.id = sa.staff_id where sa.business_id=$1 and sa.created_at >= $2 order by sa.created_at desc limit 60`, m.BusinessID, day)
+		from sales sa left join staff st on st.id = sa.staff_id where sa.business_id=$1 and sa.created_at >= $2 and ($3 or sa.staff_id=nullif($4,'')::uuid) order by sa.created_at desc`, "created_at desc", "created_at total_cents client_name method status", m.BusinessID, day, seeAll, m.StaffID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	var receipt M
+	if id := r.URL.Query().Get("receipt"); id != "" {
+		receipt, err = s.checkoutReceipt(r, id)
+		if err != nil && !isNoRows(err) {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
 	var taxBP int
 	_ = s.pool.QueryRow(ctx, `select sales_tax_bp from businesses where id=$1`, m.BusinessID).Scan(&taxBP)
 	packages, _ := rows(ctx, s.pool, `select p.id, p.name, p.description, p.price_cents, p.valid_days,
@@ -74,7 +89,7 @@ func (s *Server) mCheckout(w http.ResponseWriter, r *http.Request) {
 		(select coalesce(json_agg(json_build_object('service_id', mi.service_id, 'name', sv.name, 'qty', mi.qty) order by sv.name), '[]') from membership_items mi join services sv on sv.id = mi.service_id where mi.membership_id = ms.id) as items
 		from memberships ms where ms.business_id=$1 and ms.active order by ms.name`, m.BusinessID)
 	locations, _ := rows(ctx, s.pool, `select id, name, is_primary from locations where business_id=$1 order by is_primary desc, name`, m.BusinessID)
-	writeJSON(w, 200, M{"queue": queue, "services": services, "products": products, "staff": staff, "sales": today, "tax_bp": taxBP, "payments_mode": s.payMode(m.Market),
+	writeJSON(w, 200, M{"queue": queue, "services": services, "products": products, "staff": staff, "sales": today, "sales_pagination": salesPage, "receipt": receipt, "tax_bp": taxBP, "payments_mode": s.payMode(m.Market),
 		"packages": packages, "memberships": memberships, "can_take_payments": perm(m, "take_payments"), "locations": locations, "loyalty": loyaltyFor(ctx, s.pool, m.BusinessID)})
 }
 
@@ -102,6 +117,8 @@ func (s *Server) mCheckoutPay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
+		RequestID     string     `json:"request_id"`
+		ReplayOnly    bool       `json:"replay_only"`
 		BookingID     string     `json:"booking_id"`
 		ClientID      string     `json:"client_id"`
 		ClientName    string     `json:"client_name"`
@@ -121,7 +138,41 @@ func (s *Server) mCheckoutPay(w http.ResponseWriter, r *http.Request) {
 	}
 	// "link" is only ever set by the pay-link flow itself: to price a sale, and to record it once the client has paid.
 	dryRun, linkPaid := ctx.Value(dryRunKey{}) != nil, ctx.Value(linkPaidKey{}) != nil
-	if !payMethods[req.Method] && !(req.Method == "link" && (dryRun || linkPaid)) {
+	// A request_id makes a quick sale safe to retry (the same id answers with the same receipt). Clients send one;
+	// a call without it still records the sale, with no protection against a repeated submit.
+	requestKey, fingerprint := "", ""
+	if !dryRun && !linkPaid && req.RequestID != "" {
+		if !checkoutRequestID.MatchString(req.RequestID) {
+			writeErr(w, 400, "invalid checkout request_id")
+			return
+		}
+		requestKey = checkoutHash([]byte(req.RequestID))
+		req.RequestID = ""
+		var err error
+		fingerprint, err = checkoutFingerprint(req)
+		if err != nil {
+			writeErr(w, 400, "invalid checkout request")
+			return
+		}
+	}
+	if req.ReplayOnly && (requestKey == "" || dryRun || linkPaid) {
+		writeErr(w, 400, "receipt recovery needs a checkout request_id")
+		return
+	}
+	// Load the read-only pricing snapshot before reserving a pool connection.
+	// Waiting retries must not exhaust the pool needed by the lock holder.
+	prices := s.loadPricing(ctx, m.BusinessID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+	if requestKey != "" && checkoutReplay(ctx, tx, w, m, requestKey, fingerprint, req.ReplayOnly) {
+		return
+	}
+
+	if !req.ReplayOnly && !payMethods[req.Method] && !(req.Method == "link" && (dryRun || linkPaid)) {
 		writeErr(w, 400, "choose how the client is paying")
 		return
 	}
@@ -129,12 +180,6 @@ func (s *Server) mCheckoutPay(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "the tip and discount cannot be negative")
 		return
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	defer tx.Rollback(ctx)
 
 	var bookingID, clientID, staffID *string
 	clientName := strings.TrimSpace(req.ClientName)
@@ -228,7 +273,6 @@ func (s *Server) mCheckoutPay(w http.ResponseWriter, r *http.Request) {
 		creditID  *string // the package or membership credit that paid for this line
 		list      *int    // what the line would have cost without the credit
 	}
-	prices := s.loadPricing(ctx, m.BusinessID)
 	now := time.Now().In(m.Loc)
 	needClient := func() bool {
 		if clientID == nil {
@@ -572,13 +616,25 @@ func (s *Server) mCheckoutPay(w http.ResponseWriter, r *http.Request) {
 			"promo_discount_cents": promoOff, "points_used": pointsUsed, "points_discount_cents": pointsOff, "points_earned": pointsEarned})
 		return
 	}
+	response, err := json.Marshal(M{"ok": true, "sale_id": saleID, "method": req.Method, "client_name": clientName, "subtotal_cents": subtotal, "discount_cents": req.DiscountCents, "tax_cents": tax, "tip_cents": req.TipCents, "deposit_cents": deposit, "total_cents": due, "member_discount_cents": memberDiscount, "lead_fee_cents": leadFee,
+		"promo_discount_cents": promoOff, "points_used": pointsUsed, "points_discount_cents": pointsOff, "points_earned": pointsEarned})
+	if err != nil {
+		writeErr(w, 500, "could not encode checkout response")
+		return
+	}
+	response = append(response, '\n')
+	if requestKey != "" {
+		if _, err := tx.Exec(ctx, `insert into checkout_requests (business_id, request_key, merchant_id, payload_hash, sale_id, response_body) values ($1,$2,$3,$4,$5,$6)`, m.BusinessID, requestKey, m.ID, fingerprint, saleID, string(response)); err != nil {
+			writeErr(w, 503, "could not save this checkout; retry the same request")
+			return
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	s.lowStockNotice(m.BusinessID)
-	writeJSON(w, 201, M{"ok": true, "sale_id": saleID, "subtotal_cents": subtotal, "discount_cents": req.DiscountCents, "tax_cents": tax, "tip_cents": req.TipCents, "deposit_cents": deposit, "total_cents": due, "member_discount_cents": memberDiscount, "lead_fee_cents": leadFee,
-		"promo_discount_cents": promoOff, "points_used": pointsUsed, "points_discount_cents": pointsOff, "points_earned": pointsEarned})
+	checkoutResponse(w, response)
 }
 
 // POST /v1/m/sales/{id}/refund   {amount_cents, reason, restock}
@@ -587,6 +643,7 @@ func (s *Server) mSaleRefund(w http.ResponseWriter, r *http.Request) {
 	m := mc(r)
 	id := chi.URLParam(r, "id")
 	var req struct {
+		RequestID   string `json:"request_id"`
 		AmountCents int    `json:"amount_cents"`
 		Reason      string `json:"reason"`
 		Restock     bool   `json:"restock"`
@@ -594,6 +651,16 @@ func (s *Server) mSaleRefund(w http.ResponseWriter, r *http.Request) {
 	if err := readJSON(r, &req); err != nil || strings.TrimSpace(req.Reason) == "" {
 		writeErr(w, 400, "give a reason for the refund")
 		return
+	}
+	requestKey, fingerprint := "", ""
+	if req.RequestID != "" {
+		if !checkoutRequestID.MatchString(req.RequestID) {
+			writeErr(w, 400, "invalid refund request_id")
+			return
+		}
+		requestKey = checkoutHash([]byte(req.RequestID))
+		req.RequestID = ""
+		fingerprint, _ = checkoutFingerprint(req)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -604,10 +671,59 @@ func (s *Server) mSaleRefund(w http.ResponseWriter, r *http.Request) {
 	var total, refunded int
 	var method, client string
 	var bookingID, staffID *string
-	if err := tx.QueryRow(ctx, `select total_cents, refunded_cents, method, client_name, booking_id::text, staff_id::text from sales where id=$1 and business_id=$2 for update`, id, m.BusinessID).
-		Scan(&total, &refunded, &method, &client, &bookingID, &staffID); err != nil {
+	var saleLocation string
+	if err := tx.QueryRow(ctx, `select total_cents, refunded_cents, method, client_name, booking_id::text, staff_id::text, coalesce(location_id::text,'') from sales where id=$1 and business_id=$2 for update`, id, m.BusinessID).
+		Scan(&total, &refunded, &method, &client, &bookingID, &staffID, &saleLocation); err != nil {
 		writeErr(w, 404, "sale not found")
 		return
+	}
+	if requestKey != "" {
+		var oldHash, response string
+		var code int
+		err := tx.QueryRow(ctx, `select payload_hash,response_body,response_code from sale_refund_requests where sale_id=$1 and request_key=$2`, id, requestKey).Scan(&oldHash, &response, &code)
+		if err == nil {
+			if oldHash != fingerprint {
+				writeErr(w, 409, "this refund request was used with different details")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Idempotency-Replayed", "true")
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(response))
+			return
+		}
+		if !isNoRows(err) {
+			writeErr(w, 503, "could not check the refund request")
+			return
+		}
+	}
+	var pending bool
+	if err := tx.QueryRow(ctx, `select exists(select 1 from sale_refund_jobs where sale_id=$1 and status='pending')`, id).Scan(&pending); err != nil {
+		writeErr(w, 503, "could not check refund recovery")
+		return
+	}
+	if pending {
+		writeErr(w, 409, "the previous refund is awaiting provider confirmation; no additional refund was recorded")
+		return
+	}
+	var refundJob string
+	if method == "link" {
+		var paymentID string
+		var paymentRefunded int
+		if err := tx.QueryRow(ctx, `select id::text,refunded_cents from payments where sale_id=$1 and status in ('paid','refunded') order by created_at limit 1`, id).Scan(&paymentID, &paymentRefunded); err != nil {
+			writeErr(w, 409, "online payment could not be matched; refund requires reconciliation")
+			return
+		}
+		amount := req.AmountCents
+		if amount <= 0 {
+			amount = total - refunded
+		}
+		if amount > 0 && amount <= total-refunded {
+			if err := tx.QueryRow(ctx, `insert into sale_refund_jobs(sale_id,payment_id,amount_cents,target_refunded_cents) values($1,$2,$3,$4) returning id::text`, id, paymentID, amount, paymentRefunded+amount).Scan(&refundJob); err != nil {
+				writeErr(w, 503, "could not reserve refund recovery")
+				return
+			}
+		}
 	}
 	left := total - refunded
 	if req.AmountCents <= 0 {
@@ -615,6 +731,12 @@ func (s *Server) mSaleRefund(w http.ResponseWriter, r *http.Request) {
 	}
 	if left <= 0 || req.AmountCents > left {
 		writeErr(w, 400, "you can refund up to "+formatMoney(left, m.Currency)+" on this sale")
+		return
+	}
+	// Returning every line is safe only on a first full refund. Partial returns
+	// need item quantities; never put the entire sale back on the shelf twice.
+	if req.Restock && (refunded != 0 || req.AmountCents != total) {
+		writeErr(w, 400, "automatic restocking is available only for a first full refund; adjust individual returned items in Inventory")
 		return
 	}
 	var inBalance bool
@@ -628,20 +750,54 @@ func (s *Server) mSaleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := tx.Exec(ctx, `insert into ledger (business_id, kind, amount_cents, currency, method, status, in_balance, sale_id, booking_id, staff_id, description)
-		values ($1,'refund',$2,$3,$4,'settled',$5,$6,$7,$8,$9)`, m.BusinessID, -req.AmountCents, m.Currency, method, inBalance, id, bookingID, staffID, "Refund · "+client+" · "+strings.TrimSpace(req.Reason)); err != nil {
+		values ($1,'refund',$2,$3,$4,'settled',$5,$6,$7,$8,$9)`, m.BusinessID, -req.AmountCents, m.Currency, method, inBalance, id, bookingID, staffID, map[bool]string{true: "Refund reserved · ", false: "Refund · "}[refundJob != ""]+client+" · "+strings.TrimSpace(req.Reason)); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	if refundJob != "" {
+		if _, err := tx.Exec(ctx, `update sales set provider_refund_status='pending' where id=$1`, id); err != nil {
+			writeErr(w, 503, "could not reserve provider refund")
+			return
+		}
+		if _, err := tx.Exec(ctx, `update ledger set sale_refund_job_id=$2 where sale_id=$1 and kind='refund' and sale_refund_job_id is null and id=(select id from ledger where sale_id=$1 and kind='refund' order by created_at desc limit 1)`, id, refundJob); err != nil {
+			writeErr(w, 503, "could not reserve refund ledger")
+			return
+		}
+	}
 	if newStatus == "refunded" {
 		// A sale that is fully refunded gives back the points spent on it and takes back the points it earned.
-		_, _ = tx.Exec(ctx, `insert into loyalty_points (business_id, client_id, points, reason, sale_id, note, actor)
-			select business_id, client_id, -sum(points), 'adjust', sale_id, 'Sale refunded', $2 from loyalty_points where sale_id=$1 group by business_id, client_id, sale_id having sum(points) <> 0`, id, m.Email)
+		if _, err := tx.Exec(ctx, `insert into loyalty_points (business_id, client_id, points, reason, sale_id, note, actor)
+			select business_id, client_id, -sum(points), 'adjust', sale_id, 'Sale refunded', $2 from loyalty_points where sale_id=$1 group by business_id, client_id, sale_id having sum(points) <> 0`, id, m.Email); err != nil {
+			writeErr(w, 503, "could not reconcile refunded loyalty points")
+			return
+		}
 	}
 	if req.Restock {
+		if _, err := tx.Exec(ctx, `select set_config('lx.location', $1, true)`, saleLocation); err != nil {
+			writeErr(w, 500, "could not select the return location")
+			return
+		}
 		if _, err := tx.Exec(ctx, `with back as (
-			update products p set stock = p.stock + si.qty, sold = greatest(p.sold - si.qty, 0) from sale_items si where si.sale_id=$1 and si.product_id = p.id returning p.id, si.qty)
-			insert into stock_movements (business_id, product_id, delta, reason, note, actor) select $2, id, qty, 'return', $3, $4 from back`, id, m.BusinessID, "Refund · "+client, m.Email); err != nil {
+			update products p set stock = p.stock + si.qty, sold = greatest(p.sold - si.qty, 0) from (select product_id,sum(qty)::int as qty from sale_items where sale_id=$1 and product_id is not null group by product_id) si where si.product_id = p.id returning p.id, si.qty)
+			insert into stock_movements (business_id, product_id, delta, reason, note, actor, location_id) select $2, id, qty, 'return', $3, $4, nullif($5,'')::uuid from back`, id, m.BusinessID, "Refund · "+client, m.Email, saleLocation); err != nil {
 			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	responseCode := 200
+	response := M{"ok": true, "status": newStatus}
+	if refundJob != "" {
+		responseCode = 202
+		response = M{"ok": true, "status": "refund_pending", "provider_refund_status": "pending", "refund_id": refundJob, "provider_refund": "awaiting provider confirmation; recovery is automatic"}
+	}
+	if requestKey != "" {
+		raw, err := json.Marshal(response)
+		if err != nil {
+			writeErr(w, 503, "could not encode refund recovery")
+			return
+		}
+		if _, err = tx.Exec(ctx, `insert into sale_refund_requests(sale_id,request_key,payload_hash,response_body,response_code) values($1,$2,$3,$4,$5)`, id, requestKey, fingerprint, string(raw), responseCode); err != nil {
+			writeErr(w, 503, "could not save refund recovery")
 			return
 		}
 	}
@@ -649,20 +805,7 @@ func (s *Server) mSaleRefund(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	sent := ""
-	if method == "link" {
-		// The client paid online, so the money goes back the same way.
-		var payID string
-		if s.pool.QueryRow(ctx, `select id::text from payments where sale_id=$1 and status in ('paid','refunded') limit 1`, id).Scan(&payID) == nil {
-			if err := s.refundPayment(ctx, payID, req.AmountCents); err != nil {
-				sent = "recorded, but the provider did not send the money back: " + err.Error()
-				_, _ = s.pool.Exec(ctx, `update payments set problem=$2 where id=$1`, payID, "A refund was recorded but not sent: "+err.Error())
-			} else {
-				sent = "sent back to the client's card or bank"
-			}
-		}
-	}
-	writeJSON(w, 200, M{"ok": true, "status": newStatus, "provider_refund": sent})
+	writeJSON(w, responseCode, response)
 }
 
 // GET /v1/m/checkout/day?date=   the end-of-day count

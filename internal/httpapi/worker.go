@@ -21,7 +21,7 @@ import (
 
 func StartWorker(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) {
 	s := &Server{cfg: cfg, pool: pool, store: storage.New(cfg.AWSRegion, cfg.AWSBucket, cfg.AWSAccessKey, cfg.AWSSecretKey),
-		mail: mail.New(mail.Config{Provider: cfg.MailProvider, From: cfg.MailFrom, ResendKey: cfg.ResendKey,
+		mail: mail.New(mail.Config{Provider: cfg.MailProvider, From: cfg.MailFrom, ResendKey: cfg.ResendKey, RelyKitKey: cfg.RelyKitKey, RelyKitURL: cfg.RelyKitURL,
 			SMTPHost: cfg.SMTPHost, SMTPPort: cfg.SMTPPort, SMTPUser: cfg.SMTPUser, SMTPPass: cfg.SMTPPass, SMTPSecure: cfg.SMTPSecure})}
 	go func() {
 		tick := time.NewTicker(time.Minute)
@@ -36,6 +36,7 @@ func StartWorker(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) {
 				s.once(ctx, 7301, func(c context.Context) { s.settleLedger(c) })
 				s.once(ctx, 7302, func(c context.Context) { s.runAutomations(c) })
 				s.once(ctx, 7307, func(c context.Context) { s.sweepPayments(c) })
+				s.once(ctx, 7312, func(c context.Context) { s.runCampaignJobs(c) })
 				if n%10 == 1 {
 					s.once(ctx, 7303, func(c context.Context) { s.runPayouts(c) })
 					s.once(ctx, 7304, func(c context.Context) { s.renewMemberships(c) })

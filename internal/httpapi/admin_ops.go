@@ -207,7 +207,7 @@ func (s *Server) adminCredit(w http.ResponseWriter, r *http.Request) {
 // GET /v1/admin/bookings?q=&status=&business=&from=&to=
 func (s *Server) adminBookings(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	out, err := rows(r.Context(), s.pool, `
+	out, pagination, err := s.adminRows(r, `
 		select bk.id, bk.status, bk.starts_at, bk.ends_at, bk.client_name, bk.client_phone, bk.total_cents, bk.deposit_cents, bk.deposit_paid, bk.source, bk.notes, bk.created_at,
 		       b.id as business_id, b.name as business, b.slug, b.currency, b.timezone, st.name as staff,
 		       (select string_agg(name, ', ') from booking_items where booking_id = bk.id) as services
@@ -222,7 +222,7 @@ func (s *Server) adminBookings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"bookings": out})
+	writeJSON(w, 200, M{"pagination": pagination, "bookings": out})
 }
 
 // POST /v1/admin/bookings/{id}/action  {action: cancel|no_show|complete|confirm|reschedule, starts_at, reason}
@@ -298,7 +298,7 @@ func (s *Server) adminBookingAction(w http.ResponseWriter, r *http.Request) {
 // GET /v1/admin/clients?q=&filter=blocked|no_show
 func (s *Server) adminClients(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	out, err := rows(r.Context(), s.pool, `
+	out, pagination, err := s.adminRows(r, `
 		select c.id, c.name, c.phone, c.tags, c.no_show_count, c.notes, c.created_at, b.id as business_id, b.name as business, b.slug, b.currency,
 		  (select count(*) from bookings where client_id = c.id) as bookings,
 		  (select coalesce(sum(total_cents),0) from bookings where client_id = c.id and status not in ('cancelled_client','cancelled_business','no_show')) as spent_cents,
@@ -314,7 +314,7 @@ func (s *Server) adminClients(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	blocked, _ := rows(r.Context(), s.pool, `select phone, reason, blocked_by, created_at from blocked_contacts order by created_at desc`)
-	writeJSON(w, 200, M{"clients": out, "blocked": blocked})
+	writeJSON(w, 200, M{"pagination": pagination, "clients": out, "blocked": blocked})
 }
 
 var phoneRe = regexp.MustCompile(`^\+?[0-9]{7,15}$`)
@@ -351,7 +351,7 @@ func (s *Server) adminClientBlock(w http.ResponseWriter, r *http.Request) {
 // GET /v1/admin/orders?q=&status=
 func (s *Server) adminOrders(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	out, err := rows(r.Context(), s.pool, `
+	out, pagination, err := s.adminRows(r, `
 		select o.id, o.customer_name, o.customer_phone, o.status, o.fulfilment, o.subtotal_cents, o.shipping_cents, o.tax_cents, o.discount_cents, o.promo_code, o.gift_cents, o.gift_code, o.total_cents, o.address, o.created_at,
 		  (select string_agg(oi.qty || ' × ' || oi.name || case when oi.size_label <> '' then ' (' || oi.size_label || ')' else '' end, ', ') from order_items oi where oi.order_id = o.id) as items,
 		  (select string_agg(distinct oi.seller_name, ', ') from order_items oi where oi.order_id = o.id) as sellers
@@ -363,7 +363,7 @@ func (s *Server) adminOrders(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"orders": out})
+	writeJSON(w, 200, M{"pagination": pagination, "orders": out})
 }
 
 // POST /v1/admin/orders/{id}/status  {status, reason}
@@ -465,7 +465,7 @@ func (s *Server) adminProductActive(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminPayouts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	status := r.URL.Query().Get("status")
-	out, err := rows(ctx, s.pool, `select p.id, p.amount_cents, p.currency, p.status, p.provider, p.reference, p.failure_reason, p.scheduled_for, p.paid_at,
+	out, pagination, err := s.adminRows(r, `select p.id, p.amount_cents, p.currency, p.status, p.provider, p.reference, p.failure_reason, p.scheduled_for, p.paid_at,
 		b.id as business_id, b.name as business, b.slug, b.market, b.payout_hold
 		from payouts p join businesses b on b.id = p.business_id where ($1 = '' or p.status = $1) order by p.status = 'failed' desc, p.scheduled_for desc limit 200`, status)
 	if err != nil {
@@ -474,7 +474,7 @@ func (s *Server) adminPayouts(w http.ResponseWriter, r *http.Request) {
 	}
 	totals, _ := rows(ctx, s.pool, `select currency, status, count(*) as n, coalesce(sum(amount_cents),0) as cents from payouts group by currency, status order by currency, status`)
 	events, _ := rows(ctx, s.pool, `select pe.id, pe.provider, pe.kind, pe.amount_cents, pe.currency, pe.status, pe.reference, pe.created_at, pe.booking_id, pe.order_id from payment_events pe order by pe.created_at desc limit 50`)
-	writeJSON(w, 200, M{"payouts": out, "totals": totals, "payments": events})
+	writeJSON(w, 200, M{"pagination": pagination, "payouts": out, "totals": totals, "payments": events})
 }
 
 // POST /v1/admin/payouts/{id}/action  {action: retry|hold|release|mark_paid, reason}
@@ -717,7 +717,7 @@ func (s *Server) adminFlagDelete(w http.ResponseWriter, r *http.Request) {
 // GET /v1/admin/audit?q=&actor=&action=
 func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	out, err := rows(r.Context(), s.pool, `select id, actor, action, target, before, after, created_at from audit_log
+	out, pagination, err := s.adminRows(r, `select id, actor, action, target, before, after, created_at from audit_log
 		where ($1 = '' or target ilike '%'||$1||'%' or action ilike '%'||$1||'%')
 		  and ($2 = '' or actor = $2)
 		  and ($3 = '' or action like $3||'%')
@@ -727,5 +727,5 @@ func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actors, _ := rows(r.Context(), s.pool, `select actor, count(*) as n from audit_log group by actor order by n desc`)
-	writeJSON(w, 200, M{"events": out, "actors": actors})
+	writeJSON(w, 200, M{"pagination": pagination, "events": out, "actors": actors})
 }

@@ -11,6 +11,9 @@ import (
 // as a request, and for a deposit paid online, once the money has arrived. fallback is the
 // address typed at booking, used when neither the booking nor an account holds one.
 func (s *Server) bookingPlaced(bookingID, fallback string) {
+	if s.afterPaymentCommit(func(parent *Server) { parent.bookingPlaced(bookingID, fallback) }) {
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()

@@ -32,17 +32,17 @@ func (s *Server) mInbox(w http.ResponseWriter, r *http.Request) {
 	if where == "" {
 		where = "t.status='open'"
 	}
-	threads, err := rows(ctx, s.pool, `select t.id, t.client_id, t.client_name, t.channel, t.status, t.unread_business, t.last_preview, t.last_message_at, st.name as assignee
-		from threads t left join staff st on st.id = t.assigned_staff_id
+	threads, threadsPage, err := s.historyRows(r, "threads", `select t.id, t.client_id, t.client_name, t.channel, t.status, t.unread_business, t.last_preview, t.last_message_at, st.name as assignee
+		from threads t left join staff st on st.id = t.assigned_staff_id and st.business_id = t.business_id
 		where t.business_id=$1 and (`+where+`) and ($2 = '' or t.client_name ilike '%'||$2||'%' or t.last_preview ilike '%'||$2||'%') and ($3 = '' or true)
-		order by t.last_message_at desc limit 100`, m.BusinessID, strings.TrimSpace(q.Get("q")), m.StaffID)
+		order by t.last_message_at desc `, "last_message_at desc", "last_message_at client_name channel status", m.BusinessID, strings.TrimSpace(q.Get("q")), m.StaffID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	counts, _ := row(ctx, s.pool, `select count(*) filter (where status='open') as open, count(*) filter (where status='open' and unread_business > 0) as unread,
 		count(*) filter (where status='open' and assigned_staff_id::text = $2) as mine, count(*) filter (where status='closed') as closed from threads where business_id=$1`, m.BusinessID, m.StaffID)
-	writeJSON(w, 200, M{"threads": threads, "counts": counts})
+	writeJSON(w, 200, M{"threads": threads, "threads_pagination": threadsPage, "counts": counts})
 }
 
 // GET /v1/m/inbox/{id}   opening a thread marks it read
@@ -56,19 +56,30 @@ func (s *Server) mThread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.pool.Exec(ctx, `update threads set unread_business=0 where id=$1`, id)
-	messages, _ := rows(ctx, s.pool, `select id, from_business, author, body, delivery, created_at from thread_messages where thread_id=$1 order by created_at`, id)
+	messages, messagesPage, messagesErr := s.historyRows(r, "messages", `select id, from_business, author, body, delivery, created_at from thread_messages where thread_id=$1 order by created_at`, "created_at desc", "created_at author delivery", id)
+	if messagesErr != nil {
+		writeErr(w, 500, messagesErr.Error())
+		return
+	}
+	// Select the newest page first, then preserve the existing chronological
+	// message array for clients that do not request an explicit sort.
+	if r.URL.Query().Get("messages_sort") == "" {
+		for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
+			messages[left], messages[right] = messages[right], messages[left]
+		}
+	}
 	var client M
 	if t["client_id"] != nil {
-		client, _ = row(ctx, s.pool, `select c.id, c.name, c.phone, c.email, c.preferred_channel, c.no_show_count, c.created_at,`+clientStats+` from clients c where c.id=$1`, t["client_id"])
+		client, _ = row(ctx, s.pool, `select c.id, c.name, c.phone, c.email, c.preferred_channel, c.no_show_count, c.created_at,`+clientStats+` from clients c where c.id=$1 and c.business_id=$2`, t["client_id"], m.BusinessID)
 	}
 	var next M
 	if t["client_id"] != nil {
 		next, _ = row(ctx, s.pool, `select bk.id, bk.starts_at, bk.status, st.name as staff, (select string_agg(name, ' + ') from booking_items where booking_id = bk.id) as services
-			from bookings bk join staff st on st.id = bk.staff_id where bk.client_id=$1 and bk.starts_at > now() - interval '12 hours' and bk.status in ('requested','confirmed','checked_in','in_progress') order by bk.starts_at limit 1`, t["client_id"])
+			from bookings bk join staff st on st.id = bk.staff_id and st.business_id = bk.business_id where bk.client_id=$1 and bk.business_id=$2 and bk.starts_at > now() - interval '12 hours' and bk.status in ('requested','confirmed','checked_in','in_progress') order by bk.starts_at limit 1`, t["client_id"], m.BusinessID)
 	}
 	saved, _ := rows(ctx, s.pool, `select id, title, body from saved_replies where business_id=$1 order by sort, title`, m.BusinessID)
 	staff, _ := rows(ctx, s.pool, `select id, name from staff where business_id=$1 and not archived order by name`, m.BusinessID)
-	writeJSON(w, 200, M{"thread": t, "messages": messages, "client": client, "booking": next, "saved_replies": saved, "staff": staff, "mail_mode": s.mail.Mode()})
+	writeJSON(w, 200, M{"thread": t, "messages": messages, "messages_pagination": messagesPage, "client": client, "booking": next, "saved_replies": saved, "staff": staff, "mail_mode": s.mail.Mode()})
 }
 
 // deliver sends one outgoing message on the thread's channel and reports what happened.
@@ -321,7 +332,7 @@ func (s *Server) authThreadSend(w http.ResponseWriter, r *http.Request) {
 	if err := s.pool.QueryRow(ctx, `select id::text from threads where business_id=$1 and user_id=$2 and channel='in_app' limit 1`, bizID, c.ID).Scan(&id); err != nil {
 		// Link to the business's own record of this client when there is one.
 		var clientID *string
-		_ = s.pool.QueryRow(ctx, `select id::text from clients where business_id=$1 and (user_id=$2 or ($3 <> '' and phone=$3) or ($4 <> '' and email=$4)) order by (user_id=$2) desc nulls last limit 1`, bizID, c.ID, c.Phone, c.Email).Scan(&clientID)
+		_ = s.pool.QueryRow(ctx, `select id::text from clients where business_id=$1 and (user_id=$2 or ($3 <> '' and phone=$3) or ($4 <> '' and email=$4)) order by (user_id=$2) desc nulls last limit 1`, bizID, c.ID, verifiedContact(c.Phone, c.PhoneVerified), verifiedContact(c.Email, c.EmailVerified)).Scan(&clientID)
 		if err := s.pool.QueryRow(ctx, `insert into threads (business_id, client_id, user_id, client_name, channel) values ($1,$2,$3,$4,'in_app') returning id::text`, bizID, clientID, c.ID, name).Scan(&id); err != nil {
 			writeErr(w, 500, err.Error())
 			return

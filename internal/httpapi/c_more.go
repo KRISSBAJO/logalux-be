@@ -435,7 +435,7 @@ func (s *Server) importCalendar(ctx context.Context, staffID string) (blocks int
 	defer cancel()
 	req, _ := http.NewRequestWithContext(c, http.MethodGet, u.String(), nil)
 	req.Header.Set("User-Agent", "LogaLuxe calendar sync")
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	client := &http.Client{Transport: calendarTransport(), CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 3 || req.URL.Scheme != "https" {
 			return http.ErrUseLastResponse
 		}
@@ -444,6 +444,7 @@ func (s *Server) importCalendar(ctx context.Context, staffID string) (blocks int
 		}
 		return nil
 	}}
+	defer client.CloseIdleConnections()
 	res, err := client.Do(req)
 	if err != nil {
 		return save(0, "Could not reach your calendar. We will try again in ten minutes.")

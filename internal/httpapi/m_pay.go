@@ -225,6 +225,43 @@ func (s *Server) askProvider(ctx context.Context, provider, providerID, ref stri
 // settlePayment brings one payment up to date with the provider and, the first time it is seen as
 // paid, does what the money was for. It is safe to call any number of times.
 func (s *Server) settlePayment(ctx context.Context, ref string) M {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil
+	}
+	defer tx.Rollback(ctx)
+	// Lock the payment before checking the provider. Webhooks, polling and the worker serialize here.
+	var id string
+	if err := tx.QueryRow(ctx, `select id::text from payments where reference=$1 for update`, ref).Scan(&id); err != nil {
+		return nil
+	}
+	effects := []func(){}
+	atomic := *s
+	atomic.pool = &paymentDatabase{database: s.pool, tx: tx}
+	atomic.paymentEffects = &effects
+	out := atomic.settlePaymentLocked(ctx, ref)
+	if out == nil && atomic.paymentFailure == nil {
+		return nil
+	}
+	if atomic.paymentFailure != nil {
+		_ = tx.Rollback(ctx)
+		slog.Error("payment effects failed; retrying later", "reference", ref, "err", atomic.paymentFailure)
+		_, _ = s.pool.Exec(ctx, `update payments set problem='Payment received; business records are awaiting reconciliation' where reference=$1 and status='pending'`, ref)
+		return M{"reference": ref, "status": "pending", "problem": "Payment received; business records are awaiting reconciliation"}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("payment settlement rolled back", "reference", ref, "err", err)
+		// Leave pending so a later webhook or sweep can retry the complete operation.
+		_, _ = s.pool.Exec(ctx, `update payments set problem='Recording the payment failed; reconciliation will retry' where reference=$1 and status='pending'`, ref)
+		return M{"reference": ref, "status": "pending", "problem": "Payment confirmation is being reconciled; please check again"}
+	}
+	for _, effect := range effects {
+		effect()
+	}
+	return out
+}
+
+func (s *Server) settlePaymentLocked(ctx context.Context, ref string) M {
 	p, err := row(ctx, s.pool, `select id, reference, provider, purpose, business_id, booking_id, order_id, sale_id, amount_cents, currency, status, provider_id, description, url, expires_at, problem, email,
 		(select slug from businesses b where b.id = payments.business_id) as business_slug from payments where reference=$1`, ref)
 	if err != nil {
@@ -268,9 +305,7 @@ func (s *Server) settlePayment(ctx context.Context, ref string) M {
 		_ = s.pool.QueryRow(ctx, `update bookings set deposit_paid=true where id=$1 and status in ('requested','confirmed','checked_in','in_progress','completed') returning true`, p["booking_id"]).Scan(&live)
 		if !live {
 			// The booking was cancelled while the client was paying. Send the money straight back.
-			if err := s.refundPayment(ctx, id, amount); err != nil {
-				_, _ = s.pool.Exec(ctx, `update payments set problem=$2 where id=$1`, id, "Paid after the booking was cancelled, and the refund failed: "+err.Error())
-			}
+			_, _ = s.pool.Exec(ctx, `insert into payment_refund_jobs (payment_id, amount_cents) values ($1,$2) on conflict (payment_id) do nothing`, id, amount)
 			break
 		}
 		_, _ = s.pool.Exec(ctx, `insert into ledger (business_id, kind, amount_cents, currency, method, status, booking_id, description)
@@ -283,11 +318,11 @@ func (s *Server) settlePayment(ctx context.Context, ref string) M {
 		s.settleOrder(ctx, fmt.Sprint(p["order_id"]))
 		_, _ = s.pool.Exec(ctx, `insert into payment_events (provider, kind, order_id, amount_cents, currency, status, reference) values ($1,'order',$2,$3,$4,'paid',$5)`, p["provider"], p["order_id"], amount, p["currency"], ref)
 	case p["purpose"] == "gift":
-		s.giftPaid(ctx, id, ref)
+		s.paymentFailure = s.giftPaid(ctx, id, ref)
 	case p["purpose"] == "tip":
 		s.recordTip(ctx, fmt.Sprint(p["booking_id"]), amount, "card", "pending")
 	case p["purpose"] == "sale":
-		s.runPaidSale(ctx, id)
+		s.paymentFailure = s.runPaidSale(ctx, id)
 		s.rememberCard(ctx, id) // when the sale was a membership, so next month can be charged
 	}
 	if state == "paid" {
@@ -339,58 +374,22 @@ func (s *Server) merchantFor(ctx context.Context, merchantID, businessID string)
 }
 
 // runPaidSale records the sale a pay link was for, now that the money is in.
-func (s *Server) runPaidSale(ctx context.Context, paymentID string) {
-	var merchantID, businessID, currency, desc string
+func (s *Server) runPaidSale(ctx context.Context, paymentID string) error {
+	var merchantID, businessID string
 	var payload []byte
-	var amount int
-	if err := s.pool.QueryRow(ctx, `select coalesce(merchant_id::text,''), business_id::text, payload, amount_cents, currency, description from payments where id=$1`, paymentID).Scan(&merchantID, &businessID, &payload, &amount, &currency, &desc); err != nil {
-		return
+	if err := s.pool.QueryRow(ctx, `select coalesce(merchant_id::text,''),business_id::text,payload from payments where id=$1`, paymentID).Scan(&merchantID, &businessID, &payload); err != nil {
+		return err
 	}
-	problem := ""
 	m, err := s.merchantFor(ctx, merchantID, businessID)
-	if err != nil {
-		problem = "the person who made the link no longer belongs to the business"
-	} else if code, out := s.checkoutAs(ctx, m, payload, linkPaidKey{}); code == 201 {
-		_, _ = s.pool.Exec(ctx, `update payments set sale_id=$2 where id=$1`, paymentID, out["sale_id"])
-		return
-	} else {
-		problem = fmt.Sprint(out["error"])
-	}
-	// The client has paid but the sale could not be recorded as it was rung up (for example the visit was
-	// paid another way in the meantime). Keep the money in the business's balance and say what happened.
-	_, _ = s.pool.Exec(ctx, `insert into ledger (business_id, kind, amount_cents, currency, method, status, description, settles_at) values ($1,'charge',$2,$3,'link','pending',$4, now() + interval '`+settleAfter+`')`,
-		businessID, amount, currency, "Pay link · "+desc+" (received, not matched to a sale)")
-	_, _ = s.pool.Exec(ctx, `update payments set problem=$2 where id=$1`, paymentID, "Paid, but the sale could not be recorded: "+problem)
-	slog.Error("pay link paid but sale not recorded", "payment", paymentID, "why", problem)
-}
-
-// refundPayment sends money back through the provider that took it.
-func (s *Server) refundPayment(ctx context.Context, paymentID string, amount int) error {
-	var provider, ref, intent, status string
-	var paid, refunded int
-	if err := s.pool.QueryRow(ctx, `select provider, reference, payment_intent, status, amount_cents, refunded_cents from payments where id=$1`, paymentID).Scan(&provider, &ref, &intent, &status, &paid, &refunded); err != nil {
-		return errors.New("payment not found")
-	}
-	if status != "paid" && status != "refunded" {
-		return errors.New("that payment was never completed")
-	}
-	if amount <= 0 || amount > paid-refunded {
-		amount = paid - refunded
-	}
-	if amount <= 0 {
-		return nil
-	}
-	var err error
-	if provider == "stripe" {
-		err = providerJSON(ctx, http.MethodPost, "https://api.stripe.com/v1/refunds", s.cfg.StripeSecret, url.Values{"payment_intent": {intent}, "amount": {strconv.Itoa(amount)}, "metadata[ref]": {ref}}, nil, nil)
-	} else {
-		err = providerJSON(ctx, http.MethodPost, "https://api.paystack.co/refund", s.cfg.PaystackSecret, nil, M{"transaction": ref, "amount": amount}, nil)
-	}
 	if err != nil {
 		return err
 	}
-	_, _ = s.pool.Exec(ctx, `update payments set refunded_cents = refunded_cents + $2, status = case when refunded_cents + $2 >= amount_cents then 'refunded' else status end where id=$1`, paymentID, amount)
-	return nil
+	code, out := s.checkoutAs(ctx, m, payload, linkPaidKey{})
+	if code != 201 {
+		return fmt.Errorf("sale could not be recorded: %v", out["error"])
+	}
+	_, err = s.pool.Exec(ctx, `update payments set sale_id=$2 where id=$1`, paymentID, out["sale_id"])
+	return err
 }
 
 // refundDeposit returns a deposit that was paid online, when a booking is cancelled in the client's favour.
@@ -412,6 +411,7 @@ func (s *Server) refundDeposit(bookingID string) {
 
 // sweepPayments asks the providers about payments that are still open. The worker calls it every minute.
 func (s *Server) sweepPayments(ctx context.Context) {
+	s.reconcileRefunds(ctx)
 	open, _ := rows(ctx, s.pool, `select reference from payments where status='pending' and created_at < now() - interval '20 seconds' order by created_at limit 60`)
 	for _, p := range open {
 		s.settlePayment(ctx, fmt.Sprint(p["reference"]))
@@ -513,13 +513,13 @@ func (s *Server) mPayment(w http.ResponseWriter, r *http.Request) {
 // GET /v1/m/payments   online payments for this business, newest first
 func (s *Server) mPayments(w http.ResponseWriter, r *http.Request) {
 	m := mc(r)
-	out, err := rows(r.Context(), s.pool, `select reference, provider, purpose, amount_cents, currency, status, description, booking_id, sale_id, refunded_cents, problem, url, created_at, paid_at, expires_at
-		from payments where business_id=$1 order by created_at desc limit 300`, m.BusinessID)
+	out, paymentsPage, err := s.historyRows(r, "payments", `select reference, provider, purpose, amount_cents, currency, status, description, booking_id, sale_id, refunded_cents, problem, url, created_at, paid_at, expires_at
+		from payments where business_id=$1 order by created_at desc`, "created_at desc", "created_at amount_cents status purpose provider", m.BusinessID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"payments": out, "mode": s.payMode(m.Market), "provider": providerFor(m.Market)})
+	writeJSON(w, 200, M{"payments": out, "payments_pagination": paymentsPage, "mode": s.payMode(m.Market), "provider": providerFor(m.Market)})
 }
 
 // ---------- payouts through the provider ----------

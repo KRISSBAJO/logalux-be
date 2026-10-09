@@ -220,12 +220,19 @@ func (s *Server) mStaff(w http.ResponseWriter, r *http.Request) {
 		(select count(*) from bookings bk where bk.staff_id = t.staff_id and bk.starts_at::date between t.starts_on and t.ends_on and bk.status in ('requested','confirmed')) as bookings_affected
 		from time_off t join staff st on st.id = t.staff_id where t.business_id=$1 and t.ends_on >= current_date - 14 order by (t.status = 'requested') desc, t.starts_on`, m.BusinessID)
 	services, _ := rows(ctx, s.pool, `select id, name, category from services where business_id=$1 and not archived order by sort, name`, m.BusinessID)
-	rent, _ := rows(ctx, s.pool, `select rc.id, rc.staff_id, st.name as staff, st.trading_name, rc.period_start, rc.period_end, rc.amount_cents, rc.status, rc.method, rc.note, rc.paid_at
-		from rent_charges rc join staff st on st.id = rc.staff_id where rc.business_id=$1 order by (rc.status = 'due') desc, rc.period_start desc limit 60`, m.BusinessID)
+	rent, rentPage, rentErr := s.historyRows(r, "rent", `select rc.id, rc.staff_id, st.name as staff, st.trading_name, rc.period_start, rc.period_end, rc.amount_cents, rc.status, rc.method, rc.note, rc.paid_at
+		from rent_charges rc join staff st on st.id = rc.staff_id and st.business_id = rc.business_id where rc.business_id=$1 order by (rc.status = 'due') desc, rc.period_start desc`, "(status = 'due') desc, period_start desc", "period_start staff status amount_cents", m.BusinessID)
+	if rentErr != nil {
+		writeErr(w, 500, rentErr.Error())
+		return
+	}
+	rentDue, _ := rows(ctx, s.pool, `select staff_id, sum(amount_cents)::int as cents, count(*) as charges from rent_charges where business_id=$1 and status='due' group by staff_id`, m.BusinessID)
 	if private {
 		rent = []M{}
+		rentPage = nil
+		rentDue = []M{}
 	}
-	writeJSON(w, 200, M{"staff": staff, "location_hours": locHours, "time_off": timeOff, "services": services, "week": monday.Format("2006-01-02"), "rent": rent, "permission_defaults": staffPermDefaults})
+	writeJSON(w, 200, M{"staff": staff, "location_hours": locHours, "time_off": timeOff, "services": services, "week": monday.Format("2006-01-02"), "rent": rent, "rent_due": rentDue, "rent_pagination": rentPage, "permission_defaults": staffPermDefaults})
 }
 
 type mStaffReq struct {
@@ -615,9 +622,12 @@ func (s *Server) mPayroll(w http.ResponseWriter, r *http.Request) {
 	if q.Get("from") != "" {
 		from = parseDay(q.Get("from"), m.Loc)
 	}
-	to := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, m.Loc).Add(24 * time.Hour)
+	to := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, m.Loc).AddDate(0, 0, 1)
 	if q.Get("to") != "" {
-		to = parseDay(q.Get("to"), m.Loc).Add(24 * time.Hour)
+		to = parseDay(q.Get("to"), m.Loc).AddDate(0, 0, 1)
+	}
+	if q.Get("range") != "" {
+		from, to, _, _ = reportRange(q.Get("range"), m.Loc)
 	}
 	out, renters, err := s.payroll(ctx, m, from, to)
 	if err != nil {

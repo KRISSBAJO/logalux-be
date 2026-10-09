@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/csv"
+	"github.com/jackc/pgx/v5"
 	"net/http"
 	"time"
 )
@@ -14,7 +15,7 @@ const liveBooking = `bk.status not in ('cancelled_client','cancelled_business','
 func reportRange(v string, loc *time.Location) (from, to time.Time, days int, label string) {
 	now := time.Now().In(loc)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-	to = today.Add(24 * time.Hour)
+	to = today.AddDate(0, 0, 1)
 	switch v {
 	case "7d":
 		days, label = 7, "Last 7 days"
@@ -94,13 +95,14 @@ func (s *Server) mReports(w http.ResponseWriter, r *http.Request) {
 func (s *Server) mReportsExport(w http.ResponseWriter, r *http.Request) {
 	m := mc(r)
 	from, to, _, _ := reportRange(r.URL.Query().Get("range"), m.Loc)
-	out, err := rows(r.Context(), s.pool, `select sa.created_at, sa.client_name, st.name as staff, (select string_agg(si.name, '; ') from sale_items si where si.sale_id = sa.id) as items,
+	out, err := s.pool.Query(r.Context(), `select sa.created_at, sa.client_name, st.name as staff, (select string_agg(si.name, '; ') from sale_items si where si.sale_id = sa.id) as items,
 		sa.subtotal_cents, sa.discount_cents, sa.tax_cents, sa.tip_cents, sa.deposit_cents, sa.total_cents, sa.refunded_cents, sa.method, sa.status
-		from sales sa left join staff st on st.id = sa.staff_id where sa.business_id=$1 and sa.created_at >= $2 and sa.created_at < $3 order by sa.created_at limit 50000`, m.BusinessID, from, to)
+		from sales sa left join staff st on st.id = sa.staff_id and st.business_id = sa.business_id where sa.business_id=$1 and sa.created_at >= $2 and sa.created_at < $3 order by sa.created_at`, m.BusinessID, from, to)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	defer out.Close()
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="sales-`+from.Format("2006-01-02")+`-to-`+to.Add(-time.Second).Format("2006-01-02")+`.csv"`)
 	_, _ = w.Write([]byte("\xEF\xBB\xBF"))
@@ -108,11 +110,19 @@ func (s *Server) mReportsExport(w http.ResponseWriter, r *http.Request) {
 	cols := []string{"created_at", "client_name", "staff", "items", "subtotal_cents", "discount_cents", "tax_cents", "tip_cents", "deposit_cents", "total_cents", "refunded_cents", "method", "status"}
 	_ = cw.Write(cols)
 	rec := make([]string, len(cols))
-	for _, sa := range out {
+	for out.Next() {
+		sa, scanErr := pgx.RowToMap(out)
+		if scanErr != nil {
+			panic(http.ErrAbortHandler)
+		}
+		tidy(sa)
 		for i, k := range cols {
 			rec[i] = csvCell(sa[k])
 		}
 		_ = cw.Write(rec)
+	}
+	if out.Err() != nil {
+		panic(http.ErrAbortHandler)
 	}
 	cw.Flush()
 }

@@ -103,6 +103,7 @@ func (s *Server) availability(w http.ResponseWriter, r *http.Request) {
 }
 
 type createBookingReq struct {
+	RequestID    string         `json:"request_id"`
 	BusinessSlug string         `json:"business_slug"`
 	StaffID      string         `json:"staff_id"`
 	StartsAt     string         `json:"starts_at"`
@@ -125,6 +126,14 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 	var req createBookingReq
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.RequestID != "" && !bookingRequestID.MatchString(req.RequestID) {
+		writeErr(w, 400, "invalid booking request id")
+		return
+	}
+	requestKey, requestBody := s.bookingRequestIdentity(r, req)
+	if s.replayBooking(w, r, requestKey, requestBody) {
 		return
 	}
 	if req.BusinessSlug == "" || req.StaffID == "" || len(req.ServiceIDs) == 0 || req.ClientName == "" {
@@ -183,6 +192,9 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if taken := clash(s.resourcesFor(ctx, fmt.Sprint(biz["id"]), req.ServiceIDs, start, end, ""), start, end); taken != "" {
+		if s.replayBooking(w, r, requestKey, requestBody) {
+			return
+		}
 		writeErr(w, 409, "that time has just been taken; please choose another")
 		return
 	}
@@ -251,17 +263,33 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 	if req.ClientPhone != "" {
 		var id string
 		err = tx.QueryRow(ctx, `insert into clients (business_id, name, phone) values ($1,$2,$3)
-			on conflict (business_id, phone) do update set name=excluded.name returning id`, biz["id"], req.ClientName, req.ClientPhone).Scan(&id)
+			on conflict (business_id, phone) do nothing returning id`, biz["id"], req.ClientName, req.ClientPhone).Scan(&id)
+		// A typed number may create a new contact, but cannot claim an existing client's identity.
+		if isNoRows(err) {
+			if c, ok := s.customerFrom(ctx, bearer(r)); ok && canLinkClient(c, req.ClientPhone) {
+				err = tx.QueryRow(ctx, `select id::text from clients where business_id=$1 and phone=$2`, biz["id"], req.ClientPhone).Scan(&id)
+			}
+		}
+		if err != nil && !isNoRows(err) {
+			writeErr(w, 500, "could not save the booking contact")
+			return
+		}
 		if err == nil {
 			clientID = &id
 		}
 	}
 	var bookingID string
-	err = tx.QueryRow(ctx, `insert into bookings (business_id, location_id, staff_id, client_id, client_name, client_phone, status, starts_at, ends_at, source, total_cents, deposit_cents, deposit_paid, notes, promo_code, discount_cents)
-		values ($1,$2,$3,$4,$5,$6,'confirmed',$7,$8,$9,$10,$11,$12,$13,$14,$15) returning id`,
-		biz["id"], biz["location_id"], req.StaffID, clientID, req.ClientName, req.ClientPhone, start, end, req.Source, total, deposit, deposit > 0 && payMode == "simulation", req.Notes, promoCode, discount).Scan(&bookingID)
+	err = tx.QueryRow(ctx, `insert into bookings (business_id, location_id, staff_id, client_id, client_name, client_phone, status, starts_at, ends_at, source, total_cents, deposit_cents, deposit_paid, notes, promo_code, discount_cents, request_key_hash, request_body_hash)
+		values ($1,$2,$3,$4,$5,$6,'confirmed',$7,$8,$9,$10,$11,$12,$13,$14,$15,nullif($16,''),nullif($17,'')) returning id`,
+		biz["id"], biz["location_id"], req.StaffID, clientID, req.ClientName, req.ClientPhone, start, end, req.Source, total, deposit, deposit > 0 && payMode == "simulation", req.Notes, promoCode, discount, requestKey, requestBody).Scan(&bookingID)
 	if err != nil {
 		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && (pgErr.Code == "23505" || pgErr.Code == "23P01") && requestKey != "" {
+			_ = tx.Rollback(ctx)
+			if s.replayBooking(w, r, requestKey, requestBody) {
+				return
+			}
+		}
 		if errors.As(err, &pgErr) && pgErr.Code == "23P01" { // exclusion_violation
 			writeErr(w, 409, "that time was just taken, pick another slot")
 			return
@@ -350,6 +378,12 @@ func (s *Server) getBookingByID(w http.ResponseWriter, r *http.Request, id strin
 	}
 	items, _ := rows(ctx, s.pool, `select name, price_cents, duration_min from booking_items where booking_id=$1`, id)
 	bk["items"] = items
+	if status != http.StatusCreated && !s.ownsRecord(r, "bookings", id) {
+		for _, key := range []string{"client_name", "notes", "guest_name", "series_id", "promo_code", "source"} {
+			delete(bk, key)
+		}
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
 	// A deposit still to be paid online: where to pay it, and until when the time is held.
 	if pay, err := row(ctx, s.pool, `select reference, url, amount_cents, currency, expires_at from payments where booking_id=$1 and purpose='deposit' and status='pending' order by created_at desc limit 1`, id); err == nil {
 		bk["payment"] = pay
@@ -374,7 +408,7 @@ func (s *Server) joinWaitlist(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err := s.pool.Exec(r.Context(), `insert into clients (business_id, name, phone, tags, notes)
 		select id, $2, $3, '{waitlist}', $4 from businesses where slug=$1
-		on conflict (business_id, phone) do update set tags = array_append(array_remove(clients.tags,'waitlist'),'waitlist'), notes = excluded.notes`,
+		on conflict (business_id, phone) do update set tags = array_append(array_remove(clients.tags,'waitlist'),'waitlist')`,
 		req.BusinessSlug, req.ClientName, req.ClientPhone, "Waitlist: "+strings.Join(req.Dates, ", ")+" "+req.TimeOfDay)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -467,7 +501,10 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		}
 		itemCurrency := "USD"
 		if bizID != nil {
-			_ = tx.QueryRow(ctx, `select currency from businesses where id=$1`, *bizID).Scan(&itemCurrency)
+			if err := tx.QueryRow(ctx, `select currency from businesses where id=$1`, *bizID).Scan(&itemCurrency); err != nil {
+				writeErr(w, 503, "could not verify this seller currency; please retry")
+				return
+			}
 		}
 		if currency == "" {
 			currency = itemCurrency
@@ -535,11 +572,7 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	tax := orderTax(ctx, tx, sellerItems, sellerBiz, subtotal, discount, stateOf(req.Address))
 	total := subtotal - discount + shipping + tax
-	if currency != "USD" && strings.TrimSpace(req.GiftCode) != "" {
-		writeErr(w, 400, "gift cards are in US dollars and cannot pay for an order in naira")
-		return
-	}
-	giftID, balance, why := giftBalance(ctx, tx, req.GiftCode, "USD", true)
+	giftID, balance, why := giftBalance(ctx, tx, req.GiftCode, currency, true)
 	if why != "" {
 		writeErr(w, 400, why)
 		return
@@ -552,9 +585,17 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	// Referral credit is spent before any card is asked for.
 	credit := 0
 	buyer := s.customerID(r)
-	if buyer != nil && total > 0 && currency == "USD" { // store credit is in dollars
-		_, _ = tx.Exec(ctx, `select 1 from users where id=$1 for update`, *buyer) // one order at a time may spend it
-		if credit = creditBalance(ctx, tx, *buyer); credit > total {
+	if buyer != nil && total > 0 { // only matching-currency credit can be spent
+		// Lock the owner row so two checkouts cannot spend the same balance.
+		if _, err := tx.Exec(ctx, `select 1 from users where id=$1 for update`, *buyer); err != nil {
+			writeErr(w, 503, "could not check store credit; please retry")
+			return
+		}
+		if err := tx.QueryRow(ctx, `select greatest(coalesce(sum(amount_cents),0),0)::int from user_credits where user_id=$1 and currency=$2`, *buyer, currency).Scan(&credit); err != nil {
+			writeErr(w, 503, "could not check store credit; please retry")
+			return
+		}
+		if credit > total {
 			credit = total
 		}
 		total -= credit
@@ -593,7 +634,7 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		if _, err := tx.Exec(ctx, `insert into user_credits (user_id, amount_cents, reason, order_id) values ($1,$2,'Spent on an order',$3)`, *buyer, -credit, orderID); err != nil {
+		if _, err := tx.Exec(ctx, `insert into user_credits (user_id, amount_cents, currency, reason, order_id) values ($1,$2,$4,'Spent on an order',$3)`, *buyer, -credit, orderID, currency); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -663,16 +704,22 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getOrderByID(w http.ResponseWriter, r *http.Request, id string, status int) {
 	ctx := r.Context()
-	o, err := row(ctx, s.pool, `select * from orders where id=$1`, id)
+	o, err := row(ctx, s.pool, `select id, user_id, customer_name, customer_phone, customer_email, address, status, fulfilment, subtotal_cents, shipping_cents, tax_cents, total_cents, currency, discount_cents, gift_cents, credit_cents, promo_code, created_at from orders where id=$1`, id)
 	if err != nil {
 		writeErr(w, 404, "order not found")
 		return
 	}
+	if status != http.StatusCreated && !s.ownsRecord(r, "orders", id) {
+		for _, key := range []string{"customer_name", "customer_phone", "customer_email", "address", "promo_code"} {
+			delete(o, key)
+		}
+	}
 	delete(o, "user_id")
+	w.Header().Set("Cache-Control", "private, no-store")
 	items, _ := rows(ctx, s.pool, `select oi.seller_name, oi.name, oi.size_label, oi.qty, oi.unit_cents, coalesce(p.slug, '') as product_slug from order_items oi left join products p on p.id = oi.product_id where oi.order_id=$1`, id)
 	o["items"] = items
 	shipments, _ := rows(ctx, s.pool, `select sh.id, sh.seller_name, sh.fulfilment, sh.status, sh.items_cents, sh.shipping_cents, sh.tracking, sh.updated_at,
-		(select json_build_object('status', rt.status, 'reason', rt.reason, 'reply', rt.reply, 'refund_cents', rt.refund_cents, 'credit_cents', rt.credit_cents, 'created_at', rt.created_at, 'decided_at', rt.decided_at) from order_returns rt where rt.shipment_id = sh.id) as return
+		(select json_build_object('status', rt.status, 'provider_refund_status',rt.provider_refund_status, 'reason', rt.reason, 'reply', rt.reply, 'refund_cents', rt.refund_cents, 'credit_cents', rt.credit_cents, 'created_at', rt.created_at, 'decided_at', rt.decided_at) from order_returns rt where rt.shipment_id = sh.id) as return
 		from order_shipments sh where sh.order_id=$1 order by sh.seller_name`, id)
 	for _, sh := range shipments {
 		ok, until, why := s.returnWindow(ctx, fmt.Sprint(sh["id"]))
@@ -683,6 +730,12 @@ func (s *Server) getOrderByID(w http.ResponseWriter, r *http.Request, id string,
 			sh["return_why"] = why
 		}
 		delete(sh, "id")
+	}
+	if status != http.StatusCreated && !s.ownsRecord(r, "orders", id) {
+		for _, sh := range shipments {
+			delete(sh, "return")
+			delete(sh, "tracking")
+		}
 	}
 	o["shipments"] = shipments
 	o["return_reasons"] = returnReasons

@@ -160,15 +160,19 @@ func (s *Server) mLeads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := r.URL.Query().Get("status")
-	leads, _ := rows(ctx, s.pool, `select ld.id, ld.client_id, ld.client_name, ld.booking_id, ld.source, ld.status, ld.boosted, ld.base_pct::float8 as base_pct, ld.boost_pct::float8 as boost_pct, ld.cap_cents, ld.value_cents, ld.fee_cents,
+	leads, leadsPage, leadsErr := s.historyRows(r, "leads", `select ld.id, ld.client_id, ld.client_name, ld.booking_id, ld.source, ld.status, ld.boosted, ld.base_pct::float8 as base_pct, ld.boost_pct::float8 as boost_pct, ld.cap_cents, ld.value_cents, ld.fee_cents,
 		ld.void_reason, ld.dispute_reason, ld.disputed_at, ld.resolved_at, ld.resolution_note, ld.charged_at, ld.created_at, bk.starts_at, bk.status as booking_status,
 		(select string_agg(bi.name, ' + ') from booking_items bi where bi.booking_id = ld.booking_id) as services,
 		-- What the client has spent here since, first visit included.
 		(select coalesce(sum(sa.subtotal_cents - sa.discount_cents - sa.refunded_cents), 0) from sales sa where sa.client_id = ld.client_id and sa.business_id = ld.business_id)::int as lifetime_cents,
 		(select count(*) from bookings b2 where b2.client_id = ld.client_id and b2.business_id = ld.business_id and b2.status in ('completed','paid')) as visits,
 		(ld.status = 'charged' and ld.charged_at > now() - interval '14 days') as can_dispute
-		from leads ld left join bookings bk on bk.id = ld.booking_id
-		where ld.business_id=$1 and ($2 = '' or ld.status = $2) order by ld.created_at desc limit 500`, m.BusinessID, status)
+		from leads ld left join bookings bk on bk.id = ld.booking_id and bk.business_id = ld.business_id
+		where ld.business_id=$1 and ($2 = '' or ld.status = $2) order by ld.created_at desc`, "created_at desc", "created_at client_name status source fee_cents lifetime_cents", m.BusinessID, status)
+	if leadsErr != nil {
+		writeErr(w, 500, leadsErr.Error())
+		return
+	}
 	kpis, _ := row(ctx, s.pool, `with mine as (select * from leads where business_id=$1), month as (select * from mine where created_at >= date_trunc('month', now() at time zone $2) at time zone $2)
 		select (select count(*) from month) as month_leads,
 		(select count(*) from month where status in ('charged','disputed')) as month_charged,
@@ -192,7 +196,7 @@ func (s *Server) mLeads(w http.ResponseWriter, r *http.Request) {
 		select (select count(*) from peers) as peers, (select count(*) from peers where boost > 0) as promoted_peers, (select coalesce(max(boost),0)::float8 from peers where id <> $1) as top_bid_pct,
 		(select 1 + count(*) from peers p, peers me where me.id = $1 and p.id <> me.id and (p.boost > me.boost or (p.boost = me.boost and (p.rating > me.rating or (p.rating = me.rating and p.review_count > me.review_count))))) as position`, m.BusinessID)
 	writeJSON(w, 200, M{
-		"leads": leads, "kpis": kpis, "rank": rank,
+		"leads": leads, "leads_pagination": leadsPage, "kpis": kpis, "rank": rank,
 		"rate":     M{"base_pct": t.BasePct, "cap_cents": t.CapCents, "dispute_days": leadDisputeDays, "max_boost_pct": maxBoostPct},
 		"settings": M{"boost_pct": t.BidPct, "monthly_budget_cents": t.BudgetCents, "paused": t.Paused},
 		"boost":    M{"running": t.Boosted, "spent_cents": t.SpentCents, "total_pct": t.BasePct + t.BoostPct},

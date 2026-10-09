@@ -425,8 +425,12 @@ func (s *Server) referralCode(ctx context.Context, userID string) string {
 }
 
 func creditBalance(ctx context.Context, q rowQuerier, userID string) int {
+	return creditBalanceIn(ctx, q, userID, "USD")
+}
+
+func creditBalanceIn(ctx context.Context, q rowQuerier, userID, currency string) int {
 	var n int
-	_ = q.QueryRow(ctx, `select coalesce(sum(amount_cents),0)::int from user_credits where user_id=$1 and currency='USD'`, userID).Scan(&n)
+	_ = q.QueryRow(ctx, `select coalesce(sum(amount_cents),0)::int from user_credits where user_id=$1 and currency=$2`, userID, currency).Scan(&n)
 	if n < 0 {
 		return 0
 	}
@@ -447,7 +451,7 @@ func (s *Server) authReferral(w http.ResponseWriter, r *http.Request) {
 	var joined, paid int
 	_ = s.pool.QueryRow(ctx, `select count(*), count(*) filter (where referral_paid_at is not null) from users where referred_by=$1`, c.ID).Scan(&joined, &paid)
 	out["friends_joined"], out["friends_paid"] = joined, paid
-	history, _ := rows(ctx, s.pool, `select amount_cents, reason, created_at from user_credits where user_id=$1 order by created_at desc limit 30`, c.ID)
+	history, _ := rows(ctx, s.pool, `select amount_cents, currency, reason, created_at from user_credits where user_id=$1 order by created_at desc limit 30`, c.ID)
 	out["history"] = history
 	writeJSON(w, 200, out)
 }

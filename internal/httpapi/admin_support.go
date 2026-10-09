@@ -103,7 +103,7 @@ func (s *Server) adminSupport(w http.ResponseWriter, r *http.Request) {
 	if q.Get("mine") == "1" {
 		mine = currentAdmin(r).Email
 	}
-	out, err := rows(r.Context(), s.pool, `
+	out, pagination, err := s.adminRows(r, `
 		select t.id, t.ref, t.name, t.email, t.phone, t.role, t.subject, t.status, t.priority, t.assigned_to, t.created_at, t.updated_at, b.name as business,
 		  (select count(*) from support_messages m where m.ticket_id = t.id) as messages,
 		  (select left(m.body, 140) from support_messages m where m.ticket_id = t.id and not m.internal order by m.created_at desc limit 1) as preview
@@ -117,7 +117,7 @@ func (s *Server) adminSupport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	counts, _ := row(r.Context(), s.pool, `select count(*) filter (where status='open') as open, count(*) filter (where status='waiting') as waiting, count(*) filter (where status='closed') as closed from support_tickets`)
-	writeJSON(w, 200, M{"tickets": out, "counts": counts, "mail_mode": s.mail.Mode()})
+	writeJSON(w, 200, M{"pagination": pagination, "tickets": out, "counts": counts, "mail_mode": s.mail.Mode()})
 }
 
 // GET /v1/admin/support/{id}
@@ -379,7 +379,7 @@ func (s *Server) adminBroadcastSend(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		bg, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
-		var delivered, logged, skipped, failed int
+		var delivered, logged, skipped, failed, queued int
 		for _, x := range list {
 			text := strings.ReplaceAll(body, "{{name}}", firstNonEmpty(x.name, "there"))
 			switch {
@@ -391,6 +391,8 @@ func (s *Server) adminBroadcastSend(w http.ResponseWriter, r *http.Request) {
 					s.logMailFailure("broadcast", x.email, err)
 				case status == "sent":
 					delivered++
+				case status == "queued":
+					queued++
 				default:
 					logged++
 				}
@@ -401,7 +403,7 @@ func (s *Server) adminBroadcastSend(w http.ResponseWriter, r *http.Request) {
 				skipped++
 			}
 		}
-		_, _ = s.pool.Exec(bg, `update broadcasts set status='sent', recipients=$2, delivered=$3, logged=$4, skipped=$5, failed=$6 where id=$1`, id, len(list), delivered, logged, skipped, failed)
+		_, _ = s.pool.Exec(bg, `update broadcasts set status='sent', recipients=$2, delivered=$3, logged=$4, skipped=$5, failed=$6, queued=$7 where id=$1`, id, len(list), delivered, logged, skipped, failed, queued)
 	}()
 	writeJSON(w, 202, M{"ok": true, "recipients": len(list), "reachable": reachable(list, channel), "mode": s.channelMode(channel)})
 }

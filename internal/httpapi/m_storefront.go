@@ -23,9 +23,15 @@ func (s *Server) mStorefront(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	photos, _ := rows(ctx, s.pool, `select id, alt, active, sort, size_bytes, created_at from site_media where slot='business' and ref=$1 order by sort, created_at`, m.Slug)
-	reviews, _ := rows(ctx, s.pool, `select id, author_name, service_name, rating, body, reply, pinned, status, created_at, replied_at from reviews where business_id=$1 and status in ('published','flagged') order by pinned desc, (reply = '') desc, created_at desc limit 40`, m.BusinessID)
+	reviews, reviewsPage, reviewsErr := s.historyRows(r, "reviews", `select id, author_name, service_name, rating, body, reply, pinned, status, created_at, replied_at from reviews where business_id=$1 and status in ('published','flagged') order by pinned desc, (reply = '') desc, created_at desc`, "pinned desc, (reply = '') desc, created_at desc", "created_at author_name rating status pinned", m.BusinessID)
+	if reviewsErr != nil {
+		writeErr(w, 500, reviewsErr.Error())
+		return
+	}
+	reviewStats, _ := row(ctx, s.pool, `select count(*) filter(where status='published' and reply='') as unreplied from reviews where business_id=$1`, m.BusinessID)
+	pinnedReview, _ := row(ctx, s.pool, `select id, body, author_name from reviews where business_id=$1 and pinned and status in ('published','flagged') order by created_at desc, id limit 1`, m.BusinessID)
 	loc, _ := row(ctx, s.pool, `select name, address, city, region, hours, arrival_notes from locations where business_id=$1 and is_primary`, m.BusinessID)
-	writeJSON(w, 200, M{"business": b, "display": s.bizSettings(ctx, m.BusinessID)["storefront"], "photos": photos, "reviews": reviews, "location": loc,
+	writeJSON(w, 200, M{"business": b, "display": s.bizSettings(ctx, m.BusinessID)["storefront"], "photos": photos, "reviews": reviews, "review_stats": reviewStats, "pinned_review": pinnedReview, "reviews_pagination": reviewsPage, "location": loc,
 		"storage": s.store != nil, "url": strings.TrimRight(s.cfg.WebURL, "/") + "/b/" + m.Slug, "max_photos": mediaSlots["business"].Max})
 }
 

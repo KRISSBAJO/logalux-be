@@ -26,6 +26,10 @@ var nigerianBanks = [][2]string{
 }
 
 func providerJSON(ctx context.Context, method, endpoint, bearerKey string, form url.Values, jsonBody any, out any) error {
+	return providerJSONWithKey(ctx, method, endpoint, bearerKey, form, jsonBody, out, "")
+}
+
+func providerJSONWithKey(ctx context.Context, method, endpoint, bearerKey string, form url.Values, jsonBody any, out any, idempotencyKey string) error {
 	var body io.Reader
 	contentType := ""
 	if form != nil {
@@ -39,6 +43,9 @@ func providerJSON(ctx context.Context, method, endpoint, bearerKey string, form 
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearerKey)
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}

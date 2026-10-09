@@ -21,7 +21,9 @@ const call = async (method, path, body, token, ip = "203.0.113.10") => {
   const text = await r.text(); let json = {}; try { json = JSON.parse(text); } catch {}
   return { status: r.status, json, text, headers: r.headers };
 };
-const sql = (q) => execSync("docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
+// SQL runs against the database the API uses: DATABASE_URL in .env when set, else the local container.
+const DBURL = (() => { try { return (require("fs").readFileSync(".env", "utf8").match(/^DATABASE_URL=(.*)$/m) || [])[1]?.trim().replace(/^["']|["']$/g, "") || ""; } catch { return ""; } })();
+const sql = (q) => execSync(DBURL ? `docker exec -i logaluxe-db psql "${DBURL}${DBURL.includes("?") ? "&" : "?"}sslrootcert=system" -At` : "docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const mailLink = (to, marker) => { const m = execSync("docker logs --since 5m logaluxe-api 2>&1").toString().split("\n").filter((l) => l.includes(to) || l.includes(marker)).join("\n").match(new RegExp(marker.replace("?", "\\?") + "([0-9a-f]+)", "g")); return m ? m[m.length - 1].split("=")[1] : ""; };
 

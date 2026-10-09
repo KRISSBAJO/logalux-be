@@ -8,7 +8,7 @@ RUN rm -f /usr/local/share/ca-certificates/go.mod && update-ca-certificates
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
+RUN CGO_ENABLED=0 go test ./... && go vet ./... && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api
 
 # Run
 FROM gcr.io/distroless/static-debian12:nonroot

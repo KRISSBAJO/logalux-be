@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/csv"
+	"github.com/jackc/pgx/v5"
 	"net/http"
 	"regexp"
 	"strings"
@@ -61,7 +62,7 @@ func (s *Server) mMoney(w http.ResponseWriter, r *http.Request) {
 	if q.Get("to") != "" {
 		to = parseDay(q.Get("to"), m.Loc).Add(24 * time.Hour)
 	}
-	if !to.After(from) || to.Sub(from) > 100*24*time.Hour {
+	if !to.After(from) {
 		to = from.Add(24 * time.Hour)
 	}
 
@@ -72,20 +73,26 @@ func (s *Server) mMoney(w http.ResponseWriter, r *http.Request) {
 		coalesce(sum(amount_cents) filter (where kind in ('charge','deposit','tip') and status <> 'held' and created_at >= $3 and created_at < $2),0) as processed_prev_cents,
 		coalesce(sum(amount_cents) filter (where kind = 'tip' and created_at >= $2),0) as tips_cents,
 		coalesce(-sum(amount_cents) filter (where kind in ('fee','payout_fee') and created_at >= $2),0) as fees_cents,
+ coalesce(-sum(amount_cents) filter (where kind='lead_fee' and created_at >= $2),0) as lead_fees_cents,
+ coalesce(-sum(amount_cents) filter (where kind='plan_fee' and created_at >= $2),0) as plan_fees_cents,
 		coalesce(-sum(amount_cents) filter (where kind = 'refund' and created_at >= $2),0) as refunds_cents,
 		count(*) filter (where kind = 'refund' and created_at >= $2) as refunds,
 		(select count(*) from bookings where business_id=$1 and deposit_paid and starts_at > now() and status in ('requested','confirmed')) as deposits_for
 		from ledger where business_id=$1`, m.BusinessID, monthStart, prevStart)
-	tx, err := rows(ctx, s.pool, `select l.id, l.kind, l.amount_cents, l.method, l.status, l.in_balance, l.description, l.created_at, l.settles_at, l.sale_id, st.name as staff
-		from ledger l left join staff st on st.id = l.staff_id
+	tx, transactionsPage, err := s.historyRows(r, "transactions", `select l.id, l.kind, l.amount_cents, l.method, l.status, l.in_balance, l.description, l.created_at, l.settles_at, l.sale_id, st.name as staff
+		from ledger l left join staff st on st.id = l.staff_id and st.business_id = l.business_id
 		where l.business_id=$1 and l.created_at >= $2 and l.created_at < $3 and ($4 = '' or l.kind = $4) and ($5 = '' or l.staff_id::text = $5)
-		order by l.created_at desc limit 300`, m.BusinessID, from, to, q.Get("kind"), q.Get("staff"))
+		order by l.created_at desc `, "created_at desc", "created_at kind amount_cents status staff", m.BusinessID, from, to, q.Get("kind"), q.Get("staff"))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	payouts, _ := rows(ctx, s.pool, `select p.id, p.amount_cents, p.currency, p.status, p.kind, p.fee_cents, p.provider, p.reference, p.failure_reason, p.scheduled_for, p.paid_at, a.bank_name, a.account_last4
-		from payouts p left join payout_accounts a on a.id = p.account_id where p.business_id=$1 order by p.created_at desc limit 8`, m.BusinessID)
+	payouts, payoutsPage, payoutsErr := s.historyRows(r, "payouts", `select p.created_at, p.id, p.amount_cents, p.currency, p.status, p.kind, p.fee_cents, p.provider, p.reference, p.failure_reason, p.scheduled_for, p.paid_at, a.bank_name, a.account_last4
+		from payouts p left join payout_accounts a on a.id = p.account_id and a.business_id = p.business_id where p.business_id=$1 order by p.created_at desc `, "created_at desc", "created_at amount_cents status", m.BusinessID)
+	if payoutsErr != nil {
+		writeErr(w, 500, payoutsErr.Error())
+		return
+	}
 	methods, _ := rows(ctx, s.pool, `select method, count(*) as n, coalesce(sum(total_cents),0) as cents from sales where business_id=$1 and created_at >= $2 group by method order by cents desc`, m.BusinessID, monthStart)
 	split, _ := row(ctx, s.pool, `select
 		coalesce(sum(case when si.kind = 'product' then si.unit_cents * si.qty * coalesce(st.retail_commission_pct,0) / 100 else si.unit_cents * si.qty * coalesce(st.commission_pct,0) / 100 end),0)::int as commission_cents,
@@ -95,8 +102,8 @@ func (s *Server) mMoney(w http.ResponseWriter, r *http.Request) {
 	tax, _ := row(ctx, s.pool, `select coalesce(sum(tax_cents),0) as tax_cents from sales where business_id=$1 and created_at >= $2`, m.BusinessID, monthStart)
 	account, _ := row(ctx, s.pool, `select id, provider, status, mode, bank_name, account_last4, account_name from payout_accounts where business_id=$1 and is_default order by created_at desc limit 1`, m.BusinessID)
 	staff, _ := rows(ctx, s.pool, `select id, name from staff where business_id=$1 and not archived order by name`, m.BusinessID)
-	writeJSON(w, 200, M{"balances": s.balancesOf(ctx, m.BusinessID), "schedule": schedule, "next_payout": nextPayout(schedule, m.Loc), "month": month, "transactions": tx,
-		"from": from.Format("2006-01-02"), "to": to.Add(-time.Second).Format("2006-01-02"), "payouts": payouts, "methods": methods, "split": split, "tax": tax, "account": account, "staff": staff,
+	writeJSON(w, 200, M{"balances": s.balancesOf(ctx, m.BusinessID), "schedule": schedule, "next_payout": nextPayout(schedule, m.Loc), "month": month, "transactions": tx, "transactions_pagination": transactionsPage,
+		"from": from.Format("2006-01-02"), "to": to.Add(-time.Second).Format("2006-01-02"), "payouts": payouts, "payouts_pagination": payoutsPage, "methods": methods, "split": split, "tax": tax, "account": account, "staff": staff,
 		"payments_mode": s.payMode(m.Market), "provider": providerFor(m.Market), "month_label": monthStart.Format("January")})
 }
 
@@ -113,12 +120,13 @@ func (s *Server) mMoneyExport(w http.ResponseWriter, r *http.Request) {
 	if q.Get("to") != "" {
 		to = parseDay(q.Get("to"), m.Loc).Add(24 * time.Hour)
 	}
-	out, err := rows(r.Context(), s.pool, `select l.created_at, l.kind, l.description, l.method, l.amount_cents, l.currency, l.status, l.in_balance, st.name as staff
-		from ledger l left join staff st on st.id = l.staff_id where l.business_id=$1 and l.created_at >= $2 and l.created_at < $3 order by l.created_at limit 50000`, m.BusinessID, from, to)
+	out, err := s.pool.Query(r.Context(), `select l.created_at, l.kind, l.description, l.method, l.amount_cents, l.currency, l.status, l.in_balance, st.name as staff
+		from ledger l left join staff st on st.id = l.staff_id and st.business_id = l.business_id where l.business_id=$1 and l.created_at >= $2 and l.created_at < $3 order by l.created_at`, m.BusinessID, from, to)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	defer out.Close()
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="ledger-`+from.Format("2006-01-02")+`-to-`+to.Add(-time.Second).Format("2006-01-02")+`.csv"`)
 	_, _ = w.Write([]byte("\xEF\xBB\xBF"))
@@ -126,11 +134,19 @@ func (s *Server) mMoneyExport(w http.ResponseWriter, r *http.Request) {
 	cols := []string{"created_at", "kind", "description", "staff", "method", "amount_cents", "currency", "status", "in_balance"}
 	_ = cw.Write(append(cols[:0:0], "date", "type", "description", "staff", "method", "amount_cents", "currency", "status", "counts_towards_payout"))
 	rec := make([]string, len(cols))
-	for _, l := range out {
+	for out.Next() {
+		l, scanErr := pgx.RowToMap(out)
+		if scanErr != nil {
+			panic(http.ErrAbortHandler)
+		}
+		tidy(l)
 		for i, k := range cols {
 			rec[i] = csvCell(l[k])
 		}
 		_ = cw.Write(rec)
+	}
+	if out.Err() != nil {
+		panic(http.ErrAbortHandler)
 	}
 	cw.Flush()
 }

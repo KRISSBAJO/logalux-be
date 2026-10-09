@@ -9,7 +9,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type M = map[string]any
@@ -31,7 +30,7 @@ func readJSON(r *http.Request, dst any) error {
 }
 
 // rows runs a query and returns each row as a map, which marshals straight to JSON.
-func rows(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) ([]M, error) {
+func rows(ctx context.Context, pool database, sql string, args ...any) ([]M, error) {
 	rs, err := pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
@@ -50,7 +49,7 @@ func rows(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) ([]M
 }
 
 // row returns one row as a map, or pgx.ErrNoRows.
-func row(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) (M, error) {
+func row(ctx context.Context, pool database, sql string, args ...any) (M, error) {
 	rs, err := pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err

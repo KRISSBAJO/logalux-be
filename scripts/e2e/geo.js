@@ -12,6 +12,7 @@
 // once each; when it cannot be reached they accept the answer the API gives
 // without it, and say so.
 const { execSync } = require("child_process");
+const DBURL = (() => { try { return (require("fs").readFileSync(".env", "utf8").match(/^DATABASE_URL=(.*)$/m) || [])[1]?.trim().replace(/^["']|["']$/g, "") || ""; } catch { return ""; } })();
 const API = process.env.API || "http://localhost:18080/v1";
 const DB = process.env.DB || "logaluxe";
 const stamp = Date.now().toString(36);
@@ -25,7 +26,7 @@ const call = async (method, path, body, token) => {
   return { status: r.status, json, text };
 };
 const get = (path) => call("GET", path);
-const sql = (q) => execSync(`docker exec -i logaluxe-db psql -U logaluxe -d ${DB} -At`, { input: q }).toString().trim();
+const sql = (q) => execSync(DBURL ? `docker exec -i logaluxe-db psql "${DBURL}${DBURL.includes("?") ? "&" : "?"}sslrootcert=system" -At` : `docker exec -i logaluxe-db psql -U logaluxe -d ${DB} -At`, { input: q }).toString().trim();
 /** Kilometres between two points, worked out here so the API's own sum is checked against another. */
 const km = (a, b, c, d) => { const r = (x) => (x * Math.PI) / 180; const h = Math.sin(r(c - a) / 2) ** 2 + Math.cos(r(a)) * Math.cos(r(c)) * Math.sin(r(d - b) / 2) ** 2; return 6371 * 2 * Math.asin(Math.sqrt(h)); };
 const rising = (list) => list.every((x, i) => i === 0 || list[i - 1] <= x);
@@ -189,7 +190,7 @@ const rising = (list) => list.every((x, i) => i === 0 || list[i - 1] <= x);
     check("in development an address can be named, and is placed in its country as a guess", r.json.source === "ip" && r.json.approximate === true && r.json.country === "US" && r.json.served === true && r.json.place?.country === "US" && (!samples || r.json.nearest.every((p) => p.country === "US")), r.text.slice(0, 400));
     check("only the first part of the address is kept, with an expiry", sql("select prefix || '|' || (expires_at > now() + interval '6 days') from geo_ip where prefix='8.8.8.0/24'") === "8.8.8.0/24|true" && sql("select count(*) from geo_ip where prefix like '8.8.8.8%'") === "0");
     const n = lookedUp(); const t0 = Date.now(); r = await get("/locate?geo_ip=8.8.8.77");
-    check("a neighbour of that address is answered from what is kept", r.json.source === "ip" && r.json.country === "US" && lookedUp() === n && Date.now() - t0 < 600, `${Date.now() - t0} ms`);
+    check("a neighbour of that address is answered from what is kept", r.json.source === "ip" && r.json.country === "US" && lookedUp() === n && Date.now() - t0 < 2000, `${Date.now() - t0} ms`); // a hosted database answers slower than a local one
     r = await get("/locate?geo_ip=102.89.23.4");
     check("an address in Nigeria is placed in Nigeria", r.json.country === "NG" && r.json.served === true && r.json.place?.country === "NG" && r.json.place.currency === "NGN" && (!samples || r.json.nearest.every((p) => p.country === "NG")), r.text.slice(0, 400));
   }

@@ -17,16 +17,18 @@ import (
 )
 
 type Server struct {
-	cfg    config.Config
-	pool   *pgxpool.Pool
-	store  *storage.S3 // nil when image storage is not configured
-	mail   *mail.Mailer
-	limits *limiter
+	cfg            config.Config
+	pool           database
+	paymentEffects *[]func()
+	paymentFailure error
+	store          *storage.S3 // nil when image storage is not configured
+	mail           *mail.Mailer
+	limits         *limiter
 }
 
 func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	s := &Server{cfg: cfg, pool: pool, store: storage.New(cfg.AWSRegion, cfg.AWSBucket, cfg.AWSAccessKey, cfg.AWSSecretKey),
-		mail: mail.New(mail.Config{Provider: cfg.MailProvider, From: cfg.MailFrom, ResendKey: cfg.ResendKey,
+		mail: mail.New(mail.Config{Provider: cfg.MailProvider, From: cfg.MailFrom, ResendKey: cfg.ResendKey, RelyKitKey: cfg.RelyKitKey, RelyKitURL: cfg.RelyKitURL,
 			SMTPHost: cfg.SMTPHost, SMTPPort: cfg.SMTPPort, SMTPUser: cfg.SMTPUser, SMTPPass: cfg.SMTPPass, SMTPSecure: cfg.SMTPSecure})}
 	s.limits = newLimiter()
 	r := chi.NewRouter()
@@ -83,6 +85,8 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		r.With(s.limit("codes", 40, 10*time.Minute)).Post("/checkout/check", s.checkoutCheck)
 
 		// Customer accounts.
+		r.With(s.limit("handoff", 30, 10*time.Minute)).Post("/auth/web-handoff/preview", s.webHandoffPreview)
+		r.With(s.limit("handoff", 30, 10*time.Minute)).Post("/auth/web-handoff/exchange", s.webHandoffExchange)
 		r.With(s.limit("signup", 10, time.Hour)).Post("/auth/signup", s.authSignup)
 		r.With(s.limit("login", 20, 10*time.Minute)).Post("/auth/login", s.authLogin)
 		r.Post("/auth/logout", s.authLogout)
@@ -92,7 +96,12 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireCustomer)
 			r.Get("/auth/me", s.authMe)
+			r.With(s.limit("handoff-create", 20, 10*time.Minute)).Post("/auth/web-handoff", s.authWebHandoff)
 			r.Put("/auth/me", s.authUpdate)
+			r.Get("/auth/sessions", s.authSessions)
+			r.Delete("/auth/sessions/{id}", s.authSessionRevoke)
+			r.With(s.limit("account-export", 6, time.Hour)).Get("/auth/export", s.authExport)
+			r.With(s.limit("account-delete", 5, time.Hour)).Post("/auth/delete", s.authDelete)
 			r.Post("/auth/password", s.authPassword)
 			r.Post("/auth/verify/send", s.authVerifySend)
 			r.Post("/auth/bookings/{id}/cancel", s.authCancelBooking)

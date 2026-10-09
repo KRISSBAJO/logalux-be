@@ -44,6 +44,8 @@ type Config struct {
 	MailProvider string
 	MailFrom     string
 	ResendKey    string
+	RelyKitKey   string
+	RelyKitURL   string
 	SMTPHost     string
 	SMTPPort     string
 	SMTPUser     string
@@ -98,6 +100,8 @@ func Load() (Config, error) {
 		MailProvider:         os.Getenv("MAIL_PROVIDER"),
 		MailFrom:             os.Getenv("MAIL_FROM"),
 		ResendKey:            os.Getenv("RESEND_API_KEY"),
+		RelyKitKey:           os.Getenv("RELYKIT_API_KEY"),
+		RelyKitURL:           get("RELYKIT_BASE_URL", "https://api.relykit.com"),
 		SMTPHost:             os.Getenv("SMTP_HOST"),
 		SMTPPort:             get("SMTP_PORT", "587"),
 		SMTPUser:             os.Getenv("SMTP_USER"),

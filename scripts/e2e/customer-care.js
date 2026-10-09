@@ -18,7 +18,9 @@ const call = async (method, path, body, token) => {
   const text = await r.text(); let json = {}; try { json = JSON.parse(text); } catch {}
   return { status: r.status, json, text };
 };
-const sql = (q) => execSync("docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
+// SQL runs against the database the API uses: DATABASE_URL in .env when set, else the local container.
+const DBURL = (() => { try { return (require("fs").readFileSync(".env", "utf8").match(/^DATABASE_URL=(.*)$/m) || [])[1]?.trim().replace(/^["']|["']$/g, "") || ""; } catch { return ""; } })();
+const sql = (q) => execSync(DBURL ? `docker exec -i logaluxe-db psql "${DBURL}${DBURL.includes("?") ? "&" : "?"}sslrootcert=system" -At` : "docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async () => {
@@ -73,7 +75,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const bal1 = Number(sql(`select coalesce(sum(amount_cents),0) from ledger where business_id='${biz}'`)), fee = Number(sql(`select coalesce(-sum(amount_cents),0) from ledger where business_id='${biz}' and kind='fee' and amount_cents < 0`));
   check("the business gives the money back and gets its marketplace fee back", bal1 === bal0 - 2000 + fee, `${bal0} -> ${bal1}, fee ${fee}`);
   check("the item is back on the shelf", sql(`select stock from products where id='${pid}'`) === before);
-  r = await call("GET", `/orders/${o.id}`); check("the order shows the return was approved", r.json.order?.shipments?.[0]?.return?.status === "approved" && r.json.order.shipments[0].can_return === false, r.text.slice(0, 400));
+  r = await call("GET", `/orders/${o.id}`, undefined, C); check("the order shows the return was approved", r.json.order?.shipments?.[0]?.return?.status === "approved" && r.json.order.shipments[0].can_return === false, JSON.stringify(r.json.order?.shipments));
 
   // ----- a problem with a visit, and a tip -----
   const bid = sql(`insert into bookings (business_id, staff_id, location_id, user_id, client_name, client_phone, status, starts_at, ends_at, total_cents, paid_at)

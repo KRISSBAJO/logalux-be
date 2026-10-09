@@ -69,6 +69,8 @@ func (s *Server) sendToClient(ctx context.Context, businessID, businessName, cli
 			s.logMailFailure("client message", email, err)
 		case st == "sent":
 			status = "delivered"
+		case st == "queued":
+			status = "queued"
 		default:
 			status = "logged"
 		}
@@ -102,8 +104,8 @@ func (s *Server) mMarketing(w http.ResponseWriter, r *http.Request) {
 		  (select count(*) from visited v where exists (select 1 from bookings b2 where b2.client_id = v.client_id and b2.starts_at > v.starts_at and b2.status not in ('cancelled_client','cancelled_business','no_show'))) as rebooked,
 		  (select count(*) from bookings bk where bk.business_id=$1 and bk.status in ('completed','paid') and bk.starts_at > now() - interval '30 days') as visits,
 		  (select count(*) from reviews rv where rv.business_id=$1 and rv.created_at > now() - interval '30 days') as reviews,
-		  (select count(*) from message_sends ms where ms.business_id=$1 and ms.created_at > date_trunc('month', now()) and ms.status in ('delivered','logged')) as sent_month,
-		  (select count(*) from message_sends ms where ms.business_id=$1 and ms.marketing and ms.created_at > date_trunc('month', now()) and ms.status in ('delivered','logged')) as marketing_month,
+		  (select count(*) from message_sends ms where ms.business_id=$1 and ms.created_at > date_trunc('month', now()) and ms.status in ('delivered','logged','queued')) as sent_month,
+		  (select count(*) from message_sends ms where ms.business_id=$1 and ms.marketing and ms.created_at > date_trunc('month', now()) and ms.status in ('delivered','logged','queued')) as marketing_month,
 		  (select count(*) from clients c where c.business_id=$1 and not c.marketing_opt_in) as opted_out,
 		  (select count(*) from clients c where c.business_id=$1) as clients,
 		  (select count(distinct bk.id) from message_sends ms join bookings bk on bk.client_id = ms.client_id and bk.created_at > ms.created_at and bk.created_at < ms.created_at + interval '14 days'
@@ -111,8 +113,9 @@ func (s *Server) mMarketing(w http.ResponseWriter, r *http.Request) {
 		  (select coalesce(sum(bk.total_cents),0) from message_sends ms join bookings bk on bk.client_id = ms.client_id and bk.created_at > ms.created_at and bk.created_at < ms.created_at + interval '14 days'
 		     where ms.business_id=$1 and ms.automation_key='win_back' and ms.created_at > now() - interval '30 days') as win_back_cents`, m.BusinessID)
 	stored, _ := rows(ctx, s.pool, `select a.key, a.enabled, a.message,
-		(select count(*) from message_sends ms where ms.business_id = a.business_id and ms.automation_key = a.key and ms.created_at > now() - interval '30 days' and ms.status in ('delivered','logged')) as sent_30d,
-		(select count(*) from message_sends ms where ms.business_id = a.business_id and ms.automation_key = a.key and ms.created_at > now() - interval '30 days' and ms.status = 'delivered') as delivered_30d
+		(select count(*) from message_sends ms where ms.business_id = a.business_id and ms.automation_key = a.key and ms.created_at > now() - interval '30 days' and ms.status in ('delivered','logged','queued')) as sent_30d,
+		(select count(*) from message_sends ms where ms.business_id = a.business_id and ms.automation_key = a.key and ms.created_at > now() - interval '30 days' and ms.status = 'delivered') as delivered_30d,
+		(select count(*) from message_sends ms where ms.business_id = a.business_id and ms.automation_key = a.key and ms.created_at > now() - interval '30 days' and ms.status = 'queued') as queued_30d
 		from automations a where a.business_id=$1`, m.BusinessID)
 	byKey := map[string]M{}
 	for _, a := range stored {
@@ -251,50 +254,14 @@ func (s *Server) mCampaignSend(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	m := mc(r)
 	id := chi.URLParam(r, "id")
-	var audience, channel, subject, message string
-	// Claim the draft, so two clicks cannot send it twice.
-	if err := s.pool.QueryRow(ctx, `update campaigns set status='sending', sent_at=now() where id=$1 and business_id=$2 and status='draft' returning audience, channel, subject, message`, id, m.BusinessID).
-		Scan(&audience, &channel, &subject, &message); err != nil {
-		writeErr(w, 409, "this campaign was already sent, or does not exist")
+	if err := s.snapshotCampaign(ctx, id, m.BusinessID, m.Business, m.Slug); err != nil {
+		writeErr(w, 409, "campaign could not be scheduled: "+err.Error())
 		return
 	}
-	link := strings.TrimRight(s.cfg.WebURL, "/") + "/b/" + m.Slug
-	biz, bizName := m.BusinessID, m.Business
-	go func() {
-		bg, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-		defer cancel()
-		clients, err := rows(bg, s.pool, `select c.id, c.name, c.email, c.phone,
-			(select bi.name from bookings bk join booking_items bi on bi.booking_id = bk.id where bk.client_id = c.id and bk.status in ('completed','paid') order by bk.starts_at desc limit 1) as last_service,
-			(select count(*) from message_sends ms where ms.client_id = c.id and ms.marketing and ms.created_at > now() - interval '30 days' and ms.status in ('delivered','logged')) as recent
-			from clients c where c.business_id=$1 and c.marketing_opt_in and (`+audienceWhere[audience]+`) order by c.name limit 5000`, biz)
-		var delivered, logged, skipped, failed int
-		if err == nil {
-			for _, c := range clients {
-				if toInt(c["recent"]) >= marketingCap { // already had four this month
-					skipped++
-					continue
-				}
-				name, _ := c["name"].(string)
-				last, _ := c["last_service"].(string)
-				vals := map[string]string{"first name": firstName(name), "last service": firstNonEmpty(last, "your last visit"), "booking link": link, "staff": "the team", "business": bizName, "time": ""}
-				body := fill(message, vals)
-				email, _ := c["email"].(string)
-				phone, _ := c["phone"].(string)
-				switch s.sendToClient(bg, biz, bizName, c["id"].(string), email, phone, firstNonEmpty(fill(subject, vals), "News from "+bizName), body, "", nil, &id, true, channel) {
-				case "delivered":
-					delivered++
-				case "logged":
-					logged++
-				case "failed":
-					failed++
-				default:
-					skipped++
-				}
-			}
-		}
-		_, _ = s.pool.Exec(bg, `update campaigns set status='sent', recipients=$2, delivered=$3, logged=$4, skipped=$5, failed=$6 where id=$1`, id, len(clients), delivered, logged, skipped, failed)
-	}()
-	writeJSON(w, 202, M{"ok": true})
+	// Start on it now rather than at the worker's next minute. Jobs are claimed with row locks,
+	// so this and the worker can run at the same time without sending anything twice.
+	go s.runCampaignJobs(context.Background())
+	writeJSON(w, 202, M{"ok": true, "status": "waiting"})
 }
 
 // ---------- automations, run by the worker ----------
@@ -379,7 +346,7 @@ func (s *Server) runAutomations(ctx context.Context) {
 			  from bookings bk where bk.client_id = c.id and bk.status in ('completed','paid') order by bk.starts_at desc limit 1) last on true
 			where b.status = 'live' and c.marketing_opt_in and %s
 			  and not exists (select 1 from bookings nx where nx.client_id = c.id and nx.starts_at > now() and nx.status in ('requested','confirmed'))
-			  and (select count(*) from message_sends ms where ms.client_id = c.id and ms.marketing and ms.created_at > now() - interval '30 days' and ms.status in ('delivered','logged')) < %d
+			  and (select count(*) from message_sends ms where ms.client_id = c.id and ms.marketing and ms.created_at > now() - interval '30 days' and ms.status in ('delivered','logged','queued')) < %d
 			limit 200`, rule, marketingCap), key)
 		if err != nil {
 			slog.Error("automation query", "key", key, "err", err)

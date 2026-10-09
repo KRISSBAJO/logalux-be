@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"logaluxe/api/internal/geo"
 )
@@ -162,7 +161,7 @@ func journalCountry(w http.ResponseWriter, raw string) (string, bool) {
 }
 
 // settleScheduled marks scheduled articles whose time has come as published, so the admin list says what the public sees.
-func settleScheduled(ctx context.Context, pool *pgxpool.Pool) {
+func settleScheduled(ctx context.Context, pool database) {
 	_, _ = pool.Exec(ctx, `update articles set status='published' where status='scheduled' and published_at <= now()`)
 }
 

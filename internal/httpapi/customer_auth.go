@@ -52,7 +52,7 @@ func (s *Server) customerFrom(ctx context.Context, token string) (Customer, bool
 		return c, false
 	}
 	err := s.pool.QueryRow(ctx, `select u.id::text, coalesce(u.email,''), u.first_name, u.last_name, coalesce(u.phone,''), u.email_verified_at is not null, u.phone_verified_at is not null, u.preferred_channel, u.password_hash is not null
-		from user_sessions s join users u on u.id = s.user_id where s.token_hash = $1 and s.expires_at > now()`, hashToken(token)).
+		from user_sessions s join users u on u.id = s.user_id where s.token_hash = $1 and s.expires_at > now() and u.deleted_at is null`, hashToken(token)).
 		Scan(&c.ID, &c.Email, &c.FirstName, &c.LastName, &c.Phone, &c.EmailVerified, &c.PhoneVerified, &c.Channel, &c.HasPassword)
 	return c, err == nil
 }
@@ -72,6 +72,7 @@ func (s *Server) requireCustomer(next http.Handler) http.Handler {
 			writeErr(w, http.StatusUnauthorized, "sign in to continue")
 			return
 		}
+		_, _ = s.pool.Exec(r.Context(), `update user_sessions set device_name=$2,last_seen_at=now() where token_hash=$1 and (device_name='' or last_seen_at<now()-interval '5 minutes')`, hashToken(bearer(r)), deviceLabel(r.UserAgent()))
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, c)))
 	})
 }
@@ -230,9 +231,46 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, M{"user": c})
 		return
 	}
+	page, orderPage := customerPage(r, "page"), customerPage(r, "order_page")
+	per := 60
+	if r.URL.Query().Get("paged") == "1" {
+		per = 12
+	}
+	scope, q, status := r.URL.Query().Get("scope"), strings.TrimSpace(r.URL.Query().Get("q")), r.URL.Query().Get("status")
+	if len(q) > 100 {
+		q = q[:100]
+	}
+	filter := ` and ($2='' or b.name ilike '%'||$2||'%' or exists(select 1 from booking_items bi where bi.booking_id=bk.id and bi.name ilike '%'||$2||'%'))
+	and ($3 not in ('upcoming','past') or ($3='upcoming' and bk.status in ('requested','confirmed','checked_in','in_progress') and bk.ends_at>now()) or ($3='past' and not(bk.status in ('requested','confirmed','checked_in','in_progress') and bk.ends_at>now())))`
+	var bookingTotal, orderTotal int
+	if err := s.pool.QueryRow(ctx, `select count(*) from bookings bk join businesses b on b.id=bk.business_id where bk.user_id=$1`+filter, c.ID, q, scope).Scan(&bookingTotal); err != nil {
+		writeErr(w, 500, "could not load booking history")
+		return
+	}
+	if err := s.pool.QueryRow(ctx, `select count(*) from orders o where user_id=$1 and ($2='' or status=$2)`, c.ID, status).Scan(&orderTotal); err != nil {
+		writeErr(w, 500, "could not load order history")
+		return
+	}
+	clamp := func(p, total int) int {
+		pages := (total + per - 1) / per
+		if pages == 0 {
+			return 1
+		}
+		if pages > 0 && p > pages {
+			return pages
+		}
+		return p
+	}
+	page, orderPage = clamp(page, bookingTotal), clamp(orderPage, orderTotal)
+	order := "bk.starts_at desc,bk.id desc"
+	if scope == "upcoming" || r.URL.Query().Get("sort") == "oldest" {
+		order = "bk.starts_at asc,bk.id asc"
+	}
 	bookings, err := rows(ctx, s.pool, `
 		select bk.id, bk.status, bk.starts_at, bk.ends_at, bk.total_cents, bk.discount_cents, bk.deposit_cents, bk.deposit_paid,
 		       b.name as business, b.slug, b.currency, b.timezone, b.tone, st.name as staff, l.address, l.city,
+		       coalesce((select sm.id from site_media sm where sm.slot='business' and sm.active and sm.ref=b.slug order by sm.sort,sm.created_at limit 1),(select sm.id from site_media sm where sm.slot='logo' and sm.active and sm.ref=b.slug limit 1)) as photo_id,
+		       (select case when p.refunded_cents=p.amount_cents then 'refunded' when exists(select 1 from payment_refund_jobs j where j.payment_id=p.id and j.completed_at is null) or exists(select 1 from payment_refunds rf where rf.payment_id=p.id and rf.status in ('created','sending','unknown')) then 'pending' else '' end from payments p where p.booking_id=bk.id and p.purpose='deposit' order by p.created_at desc limit 1) as refund_state,
 		       (select string_agg(name, ', ') from booking_items where booking_id = bk.id) as services,
 		       (bk.status in ('requested','confirmed') and bk.starts_at > now()) as can_cancel,
 		       (bk.status in ('completed','paid') and not exists (select 1 from reviews rv where rv.booking_id = bk.id)) as can_review,
@@ -243,18 +281,34 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 		       (select json_build_object('ref', d.ref, 'status', d.status, 'outcome', d.outcome, 'outcome_cents', d.outcome_cents, 'decision_note', d.decision_note) from disputes d where d.booking_id = bk.id order by d.created_at desc limit 1) as problem,
 		       (select coalesce(json_agg(sm.id order by sm.sort, sm.created_at), '[]') from site_media sm join reviews rv on rv.id::text = sm.ref where sm.slot='review' and rv.booking_id = bk.id) as review_photos
 		from bookings bk join businesses b on b.id = bk.business_id join staff st on st.id = bk.staff_id left join locations l on l.id = bk.location_id
-		where bk.user_id = $1 order by bk.starts_at desc limit 60`, c.ID)
+		where bk.user_id = $1`+filter+` order by `+order+` limit $4 offset $5`, c.ID, q, scope, per, (page-1)*per)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	orders, _ := rows(ctx, s.pool, `
+	orders, err := rows(ctx, s.pool, `
 		select o.id, o.status, o.fulfilment, o.total_cents, o.discount_cents, o.gift_cents, o.credit_cents, o.currency, o.created_at,
 		       (select string_agg(oi.qty || ' × ' || oi.name, ', ') from order_items oi where oi.order_id = o.id) as items,
 		       (select coalesce(json_agg(json_build_object('seller', sh.seller_name, 'fulfilment', sh.fulfilment, 'status', sh.status, 'tracking', sh.tracking) order by sh.seller_name), '[]') from order_shipments sh where sh.order_id = o.id) as shipments,
 		       (select p.url from payments p where p.order_id = o.id and p.status = 'pending' order by p.created_at desc limit 1) as pay_url
-		from orders o where o.user_id = $1 order by o.created_at desc limit 60`, c.ID)
-	writeJSON(w, 200, M{"user": c, "bookings": bookings, "orders": orders})
+		from orders o where o.user_id = $1 and ($2='' or status=$2) order by o.created_at desc,o.id desc limit $3 offset $4`, c.ID, status, per, (orderPage-1)*per)
+	if err != nil {
+		writeErr(w, 500, "could not load order history")
+		return
+	}
+	summary, err := row(ctx, s.pool, `select
+	(select count(*) from bookings where user_id=$1 and status in ('requested','confirmed','checked_in','in_progress') and ends_at>now()) as upcoming,
+	(select count(*) from orders o where user_id=$1 and (o.status='pending' or exists(select 1 from order_shipments sh where sh.order_id=o.id and sh.status in ('new','ready','shipped')))) as active_orders,
+	(select coalesce(sum(unread_client),0) from threads where user_id=$1) as unread,
+	(select coalesce(sum(amount_cents),0) from user_credits where user_id=$1 and currency='USD') as credit_cents,
+ (select coalesce(sum(amount_cents),0) from user_credits where user_id=$1 and currency='NGN') as credit_ngn_cents,
+	(select json_build_object('business',b.name,'slug',b.slug,'starts_at',bk.starts_at,'timezone',b.timezone) from bookings bk join businesses b on b.id=bk.business_id where bk.user_id=$1 and bk.ends_at>now() and bk.status in ('requested','confirmed','checked_in','in_progress') order by bk.starts_at,bk.id limit 1) as next_booking`, c.ID)
+	if err != nil {
+		writeErr(w, 500, "could not load your account overview")
+		return
+	}
+	writeJSON(w, 200, M{"user": c, "bookings": bookings, "orders": orders, "summary": summary,
+		"booking_page": M{"page": page, "total": bookingTotal, "pages": (bookingTotal + per - 1) / per}, "order_page": M{"page": orderPage, "total": orderTotal, "pages": (orderTotal + per - 1) / per}})
 }
 
 // PUT /v1/auth/me   {first_name, last_name, phone, email}
@@ -356,7 +410,13 @@ func (s *Server) authCancelBooking(w http.ResponseWriter, r *http.Request) {
 	var bizID string
 	var starts time.Time
 	var depositPaid bool
-	if err := s.pool.QueryRow(ctx, `update bookings set status='cancelled_client', cancel_reason='Cancelled by the client' where id=$1 and user_id=$2 and status in ('requested','confirmed') and starts_at > now()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		writeErr(w, 500, "could not cancel this visit; please retry")
+		return
+	}
+	defer tx.Rollback(ctx)
+	if err := tx.QueryRow(ctx, `update bookings set status='cancelled_client', cancel_reason='Cancelled by the client' where id=$1 and user_id=$2 and status in ('requested','confirmed') and starts_at > now()
 		returning business_id::text, starts_at, deposit_paid`, id, currentCustomer(r).ID).Scan(&bizID, &starts, &depositPaid); err != nil {
 		writeErr(w, 409, "this booking cannot be cancelled here; it may have started, finished, or been cancelled already")
 		return
@@ -364,18 +424,36 @@ func (s *Server) authCancelBooking(w http.ResponseWriter, r *http.Request) {
 	policy := s.bizSettings(ctx, bizID)["policy"]
 	late := time.Until(starts) < time.Duration(settingInt(policy["cancel_hours"], 24))*time.Hour
 	kept := false
+	refundQueued := false
 	if depositPaid {
 		if fee, _ := policy["late_cancel_fee"].(string); late && fee != "none" {
-			_, _ = s.pool.Exec(ctx, `update ledger set status='pending', settles_at=now() + interval '2 days', description = description || ' (kept, late cancellation)' where booking_id=$1 and kind='deposit' and status='held'`, id)
+			_, err = tx.Exec(ctx, `update ledger set status='pending', settles_at=now() + interval '2 days', description = description || ' (kept, late cancellation)' where booking_id=$1 and kind='deposit' and status='held'`, id)
 			kept = true
 		} else {
-			_, _ = s.pool.Exec(ctx, `delete from ledger where booking_id=$1 and kind='deposit' and status='held'`, id)
-			_, _ = s.pool.Exec(ctx, `update bookings set deposit_paid=false where id=$1`, id)
-			s.refundDeposit(id)
+			_, err = tx.Exec(ctx, `delete from ledger where booking_id=$1 and kind='deposit' and status='held'`, id)
+			if err == nil {
+				_, err = tx.Exec(ctx, `update bookings set deposit_paid=false where id=$1`, id)
+			}
+			if err == nil {
+				tag, e := tx.Exec(ctx, `insert into payment_refund_jobs(payment_id,amount_cents) select id,amount_cents-refunded_cents from payments where booking_id=$1 and purpose='deposit' and status='paid' and amount_cents>refunded_cents on conflict(payment_id) do nothing`, id)
+				err = e
+				refundQueued = e == nil && tag.RowsAffected() > 0
+			}
 		}
 	}
+	if err != nil {
+		writeErr(w, 500, "could not finish cancelling; your visit has not changed")
+		return
+	}
+	if err = tx.Commit(ctx); err != nil {
+		writeErr(w, 500, "could not confirm cancellation; refresh your account before retrying")
+		return
+	}
+	if depositPaid && !kept {
+		s.refundDeposit(id)
+	}
 	s.notifyBusiness(bizID, "cancellation_email", "A client cancelled a booking", "The booking for "+starts.Format("Monday 2 January at 15:04 MST")+" was cancelled by the client. The time is open again.\n\nOpen your calendar: "+strings.TrimRight(s.cfg.WebURL, "/")+"/business/calendar")
-	writeJSON(w, 200, M{"ok": true, "late": late, "deposit_kept": kept})
+	writeJSON(w, 200, M{"ok": true, "late": late, "deposit_kept": kept, "refund_queued": refundQueued})
 }
 
 // POST /v1/auth/forgot   {email}   always answers the same way

@@ -15,7 +15,9 @@ const call = async (method, path, body, token) => {
   let json = {}; try { json = JSON.parse(text); } catch {}
   return { status: r.status, json, text };
 };
-const sql = (q) => execSync("docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
+// SQL runs against the database the API uses: DATABASE_URL in .env when set, else the local container.
+const DBURL = (() => { try { return (require("fs").readFileSync(".env", "utf8").match(/^DATABASE_URL=(.*)$/m) || [])[1]?.trim().replace(/^["']|["']$/g, "") || ""; } catch { return ""; } })();
+const sql = (q) => execSync(DBURL ? `docker exec -i logaluxe-db psql "${DBURL}${DBURL.includes("?") ? "&" : "?"}sslrootcert=system" -At` : "docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At", { input: q }).toString().trim();
 
 (async () => {
   let r = await call("POST", "/m/signup", { name: "E2E Owner", email: EMAIL, phone: "+16155550111", password: PASS, business: "E2E Test Studio " + stamp, category: "braids", market: "US", city: "Nashville", region: "TN", address: "1 Test St" });
@@ -125,7 +127,7 @@ const sql = (q) => execSync("docker exec -i logaluxe-db psql -U logaluxe -d loga
   r = await g("/money");
   check("the balance is empty after the payout", r.json.balances?.available_cents === 0 && r.json.payouts?.[0]?.status === "paid", JSON.stringify(r.json.balances) + JSON.stringify(r.json.payouts?.[0]));
   console.log("     payout →", JSON.stringify(r.json.payouts?.[0]));
-  r = await p(`/sales/${sale}/refund`, { amount_cents: 1500, reason: "wrong product", restock: true });
+  r = await p(`/sales/${sale}/refund`, { amount_cents: 1500, reason: "wrong product", restock: false }); // a part refund cannot restock by itself
   check("refund part of a sale", r.status === 200 || r.status === 201, r.text);
   r = await p(`/sales/${sale}/refund`, { amount_cents: 99999999, reason: "too much" });
   check("cannot refund more than was paid", r.status === 400, r.text);
@@ -157,9 +159,11 @@ const sql = (q) => execSync("docker exec -i logaluxe-db psql -U logaluxe -d loga
   r = await p("/campaigns", { name: "E2E offer", audience: "all", channel: "whatsapp", subject: "", message: "Hi {first name}, 10% off this week." });
   check("draft a campaign", r.status === 201, r.text); const camp = r.json.id;
   r = await p(`/campaigns/${camp}/test`, {}); check("send a test to myself", r.status === 200, r.text);
-  r = await p(`/campaigns/${camp}/send`, {}); check("send the campaign", r.status === 202, r.text); await new Promise((d) => setTimeout(d, 1500));
+  r = await p(`/campaigns/${camp}/send`, {}); check("send the campaign", r.status === 202, r.text);
   console.log("     campaign →", JSON.stringify(r.json));
-  r = await g("/marketing"); const sent = r.json.campaigns?.find((c) => c.id === camp);
+  // Sending is a job the worker works through; wait for it, up to 15 seconds.
+  let sent = null;
+  for (let i = 0; i < 30 && !(sent && sent.status === "sent"); i++) { await new Promise((d) => setTimeout(d, 500)); r = await g("/marketing"); sent = r.json.campaigns?.find((c) => c.id === camp); }
   check("the campaign is marked sent", sent && sent.status === "sent", JSON.stringify(sent));
   console.log("     campaign row →", JSON.stringify(sent));
 

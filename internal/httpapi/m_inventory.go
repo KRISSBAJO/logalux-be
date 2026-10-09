@@ -52,13 +52,18 @@ func (s *Server) mInventory(w http.ResponseWriter, r *http.Request) {
 		(select count(distinct sa.id) from sales sa where sa.business_id=$1 and sa.created_at >= $2) as sales,
 		(select count(distinct sa.id) from sales sa join sale_items si on si.sale_id = sa.id where sa.business_id=$1 and sa.created_at >= $2 and si.kind='product') as sales_with_retail`, m.BusinessID, monthStart)
 	suppliers, _ := rows(ctx, s.pool, `select su.id, su.name, su.contact, su.email, su.phone, (select count(*) from products p where p.supplier_id = su.id) as products from suppliers su where su.business_id=$1 order by su.name`, m.BusinessID)
-	orders, _ := rows(ctx, s.pool, `select po.id, po.ref, po.status, po.items, po.total_cents, po.expected_on, po.created_at, po.received_at, su.name as supplier
-		from purchase_orders po left join suppliers su on su.id = po.supplier_id where po.business_id=$1 order by (po.status = 'draft') desc, po.created_at desc limit 12`, m.BusinessID)
+	orders, ordersPage, ordersErr := s.historyRows(r, "orders", `select po.id, po.ref, po.status, po.items, po.total_cents, po.expected_on, po.created_at, po.received_at, su.name as supplier
+		from purchase_orders po left join suppliers su on su.id = po.supplier_id and su.business_id = po.business_id where po.business_id=$1 order by (po.status = 'draft') desc, po.created_at desc `, "(status = 'draft') desc, created_at desc", "created_at ref status supplier total_cents", m.BusinessID)
+	if ordersErr != nil {
+		writeErr(w, 500, ordersErr.Error())
+		return
+	}
+	draftOrder, _ := row(ctx, s.pool, `select id, ref, total_cents from purchase_orders where business_id=$1 and status='draft' order by created_at desc, id limit 1`, m.BusinessID)
 	services, _ := rows(ctx, s.pool, `select id, name, category from services where business_id=$1 and not archived order by sort, name`, m.BusinessID)
 	locations, _ := rows(ctx, s.pool, `select l.id, l.name, l.is_primary, (select coalesce(sum(ls.qty),0) from location_stock ls join products p on p.id = ls.product_id where ls.location_id = l.id and p.business_id = $1)::int as units,
 		(select coalesce(sum(ls.qty * p.cost_cents),0) from location_stock ls join products p on p.id = ls.product_id where ls.location_id = l.id and p.business_id = $1)::int as value_cents
 		from locations l where l.business_id=$1 order by l.is_primary desc, l.name`, m.BusinessID)
-	writeJSON(w, 200, M{"products": out, "kpis": kpis, "suppliers": suppliers, "orders": orders, "month_label": monthStart.Format("January"), "services": services, "storage": s.store != nil, "locations": locations, "location": q.Get("location")})
+	writeJSON(w, 200, M{"products": out, "kpis": kpis, "suppliers": suppliers, "orders": orders, "draft_order": draftOrder, "orders_pagination": ordersPage, "month_label": monthStart.Format("January"), "services": services, "storage": s.store != nil, "locations": locations, "location": q.Get("location")})
 }
 
 type mProductReq struct {
@@ -274,12 +279,12 @@ func (s *Server) mProductStock(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/m/products/{id}/history
 func (s *Server) mProductHistory(w http.ResponseWriter, r *http.Request) {
-	out, err := rows(r.Context(), s.pool, `select sm.delta, sm.reason, sm.note, sm.actor, sm.created_at, (select lo.name from locations lo where lo.id = sm.location_id) as location from stock_movements sm where sm.product_id=$1 and sm.business_id=$2 order by sm.created_at desc limit 40`, chi.URLParam(r, "id"), mc(r).BusinessID)
+	out, historyPage, err := s.historyRows(r, "history", `select sm.id, sm.delta, sm.reason, sm.note, sm.actor, sm.created_at, (select lo.name from locations lo where lo.id = sm.location_id) as location from stock_movements sm where sm.product_id=$1 and sm.business_id=$2 order by sm.created_at desc `, "created_at desc", "created_at reason actor delta", chi.URLParam(r, "id"), mc(r).BusinessID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, M{"history": out})
+	writeJSON(w, 200, M{"history": out, "history_pagination": historyPage})
 }
 
 // POST /v1/m/suppliers   {name, contact, email, phone}

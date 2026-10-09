@@ -373,16 +373,24 @@ func (s *Server) mLogout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) mMe(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	m := mc(r)
-	businesses, _ := rows(ctx, s.pool, `select b.id, b.name, b.slug, mm.role, l.name as area from merchant_members mm join businesses b on b.id = mm.business_id
+	businesses, err := rows(ctx, s.pool, `select b.id, b.name, b.slug, mm.role, l.name as area from merchant_members mm join businesses b on b.id = mm.business_id
 		left join locations l on l.business_id = b.id and l.is_primary where mm.merchant_id = $1 order by b.name`, m.ID)
-	badges, _ := row(ctx, s.pool, `select
+	if err != nil {
+		writeErr(w, 503, "could not load your business account")
+		return
+	}
+	badges, err := row(ctx, s.pool, `select
 		(select coalesce(sum(unread_business),0) from threads where business_id=$1 and status='open') as inbox,
 		(select count(*) from bookings where business_id=$1 and status in ('checked_in','in_progress','completed') and paid_at is null and starts_at > now() - interval '2 days') as checkout,
 		(select count(*) from time_off where business_id=$1 and status='requested') as time_off,
 		(select count(*) from locations where business_id=$1) as locations,
 		(select name from locations where business_id=$1 and is_primary) as area,
 		(select verification_status from businesses where id=$1) as verification`, m.BusinessID)
-	writeJSON(w, 200, M{"merchant": m, "businesses": businesses, "badges": badges})
+	if err != nil {
+		writeErr(w, 503, "could not load business activity")
+		return
+	}
+	writeJSON(w, 200, M{"merchant": m, "businesses": businesses, "badges": badges, "mail_mode": s.mail.Mode(), "modes": M{"email": s.mail.Mode(), "sms": s.smsMode(m.Market), "whatsapp": s.whatsappMode()}})
 }
 
 // POST /v1/m/switch   {business_id}   open another business you belong to

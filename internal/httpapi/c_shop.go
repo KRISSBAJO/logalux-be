@@ -194,7 +194,7 @@ func (s *Server) unwindOrder(ctx context.Context, orderID string) {
 		where t.order_id=$1 and t.amount_cents < 0 and not exists (select 1 from gift_card_txns r where r.order_id=$1 and r.amount_cents > 0)`, orderID); err == nil && tag.RowsAffected() > 0 {
 		_, _ = s.pool.Exec(ctx, `update gift_cards g set balance_cents = g.balance_cents + t.amount_cents from gift_card_txns t where t.order_id=$1 and t.amount_cents > 0 and g.id = t.gift_card_id`, orderID)
 	}
-	_, _ = s.pool.Exec(ctx, `insert into user_credits (user_id, amount_cents, reason, order_id) select c.user_id, -c.amount_cents, 'Returned: the order was not paid', c.order_id from user_credits c
+	_, _ = s.pool.Exec(ctx, `insert into user_credits (user_id, amount_cents, currency, reason, order_id) select c.user_id, -c.amount_cents, c.currency, 'Returned: the order was not paid', c.order_id from user_credits c
 		where c.order_id=$1 and c.amount_cents < 0 and not exists (select 1 from user_credits r where r.order_id=$1 and r.amount_cents > 0)`, orderID)
 	_, _ = s.pool.Exec(ctx, `update promo_codes p set used = greatest(p.used - 1, 0) from orders o where o.id=$1 and o.promo_code <> '' and upper(p.code) = upper(o.promo_code)`, orderID)
 }
@@ -231,12 +231,12 @@ func (s *Server) mOrders(w http.ResponseWriter, r *http.Request) {
 	if filter == "" {
 		filter = "true"
 	}
-	out, err := rows(ctx, s.pool, `select sh.id, sh.order_id, sh.fulfilment, sh.status, sh.items_cents, sh.shipping_cents, sh.tracking, sh.note, sh.updated_at, o.customer_name, o.customer_phone, o.customer_email, o.status as order_status, o.created_at,
+	out, pagination, err := s.historyRows(r, "orders", `select sh.id, sh.order_id, sh.fulfilment, sh.status, sh.items_cents, sh.shipping_cents, sh.tracking, sh.note, sh.updated_at, o.customer_name, o.customer_phone, o.customer_email, o.status as order_status, o.created_at,
 		case when sh.fulfilment = 'ship' then o.address end as address,
 		(select coalesce(json_agg(json_build_object('name', oi.name, 'size', oi.size_label, 'qty', oi.qty, 'unit_cents', oi.unit_cents) order by oi.name), '[]') from order_items oi where oi.order_id = o.id and oi.seller_name = sh.seller_name) as items,
 		(select coalesce(sum(l.amount_cents),0) from ledger l where l.order_id = o.id and l.business_id = sh.business_id)::int as net_cents
 		from order_shipments sh join orders o on o.id = sh.order_id
-		where sh.business_id=$1 and o.status <> 'pending' and (`+filter+`) order by (sh.status in ('new','ready','shipped')) desc, o.created_at desc limit 300`, m.BusinessID)
+		where sh.business_id=$1 and o.status <> 'pending' and (`+filter+`) order by (sh.status in ('new','ready','shipped')) desc, o.created_at desc`, "(status in ('new','ready','shipped')) desc, created_at desc", "created_at customer_name status items_cents fulfilment", m.BusinessID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -246,7 +246,7 @@ func (s *Server) mOrders(w http.ResponseWriter, r *http.Request) {
 		from order_shipments sh join orders o on o.id = sh.order_id where sh.business_id=$1 and o.status <> 'pending'`, m.BusinessID)
 	var pct float64
 	_ = s.pool.QueryRow(ctx, `select coalesce((select marketplace_pct from fees where market=$1 and plan=$2 and status='approved' and effective_from <= current_date order by effective_from desc limit 1),0)::float8`, m.Market, m.Plan).Scan(&pct)
-	writeJSON(w, 200, M{"orders": out, "counts": counts, "marketplace_pct": pct})
+	writeJSON(w, 200, M{"orders": out, "orders_pagination": pagination, "counts": counts, "marketplace_pct": pct})
 }
 
 // POST /v1/m/orders/{id}   {action: ready|shipped|delivered|collected, tracking}
