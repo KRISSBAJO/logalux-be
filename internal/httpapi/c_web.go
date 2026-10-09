@@ -90,13 +90,35 @@ func (s *Server) openings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, M{"slots": s.nextOpenings(ctx, id, loc, ids, q.Get("staff"), limit, 3), "service": label, "service_ids": ids})
 }
 
-// GET /v1/openings?slugs=a,b,c&q=knotless   the next three free times of several businesses, for search results
+// windowDays is the calendar days a search "When" covers, by the business's own clock: today, tomorrow, or
+// the coming Saturday and Sunday (only Sunday once it is Sunday). Unknown words give no days.
+func windowDays(when string, now time.Time) []time.Time {
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	switch when {
+	case "today":
+		return []time.Time{day}
+	case "tomorrow":
+		return []time.Time{day.AddDate(0, 0, 1)}
+	case "weekend":
+		toSat := (int(time.Saturday) - int(day.Weekday()) + 7) % 7
+		if day.Weekday() == time.Sunday {
+			return []time.Time{day}
+		}
+		sat := day.AddDate(0, 0, toSat)
+		return []time.Time{sat, sat.AddDate(0, 0, 1)}
+	}
+	return nil
+}
+
+// GET /v1/openings?slugs=a,b,c&q=knotless&when=today   the next three free times of several businesses, for search results.
+// With `when` (today, tomorrow or weekend), each business also says whether it has a free time in that window.
 func (s *Server) openingsBatch(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	slugs := splitCSV(r.URL.Query().Get("slugs"))
 	if len(slugs) > 24 {
 		slugs = slugs[:24]
 	}
+	when := r.URL.Query().Get("when")
 	out := M{}
 	for _, slug := range slugs {
 		id, loc, ok := s.liveBusiness(ctx, slug)
@@ -107,9 +129,38 @@ func (s *Server) openingsBatch(w http.ResponseWriter, r *http.Request) {
 		if svc == "" {
 			continue
 		}
-		out[slug] = M{"service_id": svc, "service": name, "slots": s.nextOpenings(ctx, id, loc, []string{svc}, "any", 3, 2)}
+		slots := s.nextOpenings(ctx, id, loc, []string{svc}, "any", 3, 2)
+		entry := M{"service_id": svc, "service": name, "slots": slots}
+		if days := windowDays(when, time.Now().In(loc)); days != nil {
+			entry["in_window"] = s.freeInWindow(ctx, id, loc, svc, slots, days)
+		}
+		out[slug] = entry
 	}
-	writeJSON(w, 200, M{"openings": out})
+	writeJSON(w, 200, M{"openings": out, "when": when})
+}
+
+// freeInWindow says whether the business has a free time on one of the days, obeying the same booking rules as the
+// next free times. A day already among the next free times needs no second look.
+func (s *Server) freeInWindow(ctx context.Context, businessID string, loc *time.Location, serviceID string, slots []openSlot, days []time.Time) bool {
+	rules := s.bizSettings(ctx, businessID)["booking"]
+	lead, maxDays := settingInt(rules["lead_hours"], 2), settingInt(rules["max_days"], 60)
+	now := time.Now()
+	for _, d := range days {
+		date := d.Format("2006-01-02")
+		for _, sl := range slots {
+			if at, err := time.Parse(time.RFC3339, sl.StartAt); err == nil && at.In(loc).Format("2006-01-02") == date {
+				return true
+			}
+		}
+		if d.After(now.AddDate(0, 0, maxDays)) {
+			continue
+		}
+		free, _, err := s.openSlots(ctx, businessID, loc, d, []string{serviceID}, "any", now.Add(time.Duration(lead)*time.Hour), "")
+		if err == nil && len(free) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // GET /v1/businesses/{slug}/days?month=2026-10&services=id,id&staff=id|any   which days of a month have a free time
@@ -164,7 +215,8 @@ func (s *Server) businessReviews(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query()
 	var id, owner, summary string
-	if err := s.pool.QueryRow(ctx, `select id::text, coalesce(owner_name,''), review_summary from businesses where slug=$1 and status <> 'suspended'`, chi.URLParam(r, "slug")).Scan(&id, &owner, &summary); err != nil {
+	// The AI-written summary is shown only once a person has approved it in the console.
+	if err := s.pool.QueryRow(ctx, `select id::text, coalesce(owner_name,''), case when review_summary_approved_at is not null then review_summary else '' end from businesses where slug=$1 and status <> 'suspended'`, chi.URLParam(r, "slug")).Scan(&id, &owner, &summary); err != nil {
 		writeErr(w, 404, "business not found")
 		return
 	}
@@ -205,19 +257,29 @@ func (s *Server) summariseReviews(ctx context.Context) {
 		and (select count(*) from reviews rv where rv.business_id=b.id and rv.status='published') >= 5
 		and (b.review_summary_at is null or exists (select 1 from reviews rv where rv.business_id=b.id and rv.status='published' and rv.created_at > b.review_summary_at)) limit 10`)
 	for _, b := range due {
-		list, _ := rows(ctx, s.pool, `select rating, service_name, body from reviews where business_id=$1 and status='published' order by created_at desc limit 40`, b["id"])
-		var text strings.Builder
-		for _, rv := range list {
-			fmt.Fprintf(&text, "%v stars (%v): %v\n", rv["rating"], rv["service_name"], rv["body"])
-		}
-		system := `You summarise what clients say about a beauty business, for people deciding whether to book. Write two plain sentences, at most 45 words in total.
-Say only what several reviews support, including a common complaint if there is one. No names of clients, no superlatives, no "overall", no advice. Do not mention the star ratings. Output only the two sentences.`
-		summary, err := s.aiWrite(ctx, fmt.Sprint(b["id"]), system, "Business: "+fmt.Sprint(b["name"])+"\nReviews:\n"+text.String(), false)
-		if err != nil {
+		if _, err := s.summariseBusiness(ctx, fmt.Sprint(b["id"]), fmt.Sprint(b["name"])); err != nil {
 			return
 		}
-		_, _ = s.pool.Exec(ctx, `update businesses set review_summary=$2, review_summary_at=now() where id=$1`, b["id"], strings.Trim(summary, "\""))
 	}
+}
+
+// summariseBusiness writes one business's summary from its published reviews and saves it unapproved:
+// nothing the AI wrote reaches the public page until a person approves it in the console.
+func (s *Server) summariseBusiness(ctx context.Context, businessID, name string) (string, error) {
+	list, _ := rows(ctx, s.pool, `select rating, service_name, body from reviews where business_id=$1 and status='published' order by created_at desc limit 40`, businessID)
+	var text strings.Builder
+	for _, rv := range list {
+		fmt.Fprintf(&text, "%v stars (%v): %v\n", rv["rating"], rv["service_name"], rv["body"])
+	}
+	system := `You summarise what clients say about a beauty business, for people deciding whether to book. Write two plain sentences, at most 45 words in total.
+Say only what several reviews support, including a common complaint if there is one. No names of clients, no superlatives, no "overall", no advice. Do not mention the star ratings. Output only the two sentences.`
+	summary, err := s.aiWrite(ctx, businessID, system, "Business: "+name+"\nReviews:\n"+text.String(), false)
+	if err != nil {
+		return "", err
+	}
+	summary = strings.Trim(strings.TrimSpace(summary), "\"")
+	_, err = s.pool.Exec(ctx, `update businesses set review_summary=$2, review_summary_at=now(), review_summary_approved_at=null, review_summary_approved_by=null where id=$1`, businessID, summary)
+	return summary, err
 }
 
 // ---------- saved businesses ----------
@@ -300,7 +362,8 @@ func (s *Server) authBooking(w http.ResponseWriter, r *http.Request) {
 		coalesce((select sm.id from site_media sm where sm.slot='business' and sm.active and sm.ref=b.slug order by sm.sort,sm.created_at limit 1),(select sm.id from site_media sm where sm.slot='logo' and sm.active and sm.ref=b.slug limit 1)) as photo_id,
 		       (select case when p.refunded_cents=p.amount_cents then 'refunded' when exists(select 1 from payment_refund_jobs j where j.payment_id=p.id and j.completed_at is null) or exists(select 1 from payment_refunds rf where rf.payment_id=p.id and rf.status in ('created','sending','unknown')) then 'pending' else '' end from payments p where p.booking_id=bk.id and p.purpose='deposit' order by p.created_at desc limit 1) as refund_state,
 		       (bk.status in ('requested','confirmed') and bk.starts_at > now()) as can_cancel,
-		       (bk.status in ('completed','paid') and not exists (select 1 from reviews rv where rv.booking_id = bk.id)) as can_review,
+		       bk.is_internal,
+		       (bk.status in ('completed','paid') and not bk.is_internal and not customer_business_member(bk.user_id,bk.business_id) and not exists (select 1 from reviews rv where rv.booking_id = bk.id)) as can_review,
 		       (select rv.id from reviews rv where rv.booking_id = bk.id limit 1) as review_id,
 		       (bk.status in ('paid','completed') and bk.starts_at > now() - interval '30 days') as can_tip,
 		       (select coalesce(sum(l.amount_cents),0) from ledger l where l.booking_id = bk.id and l.kind = 'tip')::int as tip_cents,

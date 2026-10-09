@@ -158,6 +158,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 
 			// Everyone on the team: the day's work.
 			r.Get("/me", s.mMe)
+			r.Post("/customer-profile", s.mCustomer)
 			r.Post("/switch", s.mSwitch)
 			r.Post("/password", s.mPassword)
 			r.Get("/my-day", s.mMyDay)
@@ -392,6 +393,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 				r.Post("/leads/{id}/resolve", s.adminLeadResolve)
 				r.Post("/businesses/{id}/status", s.adminBusinessStatus)
 				r.Patch("/businesses/{id}", s.adminBusinessUpdate)
+				r.Post("/businesses/{id}/review-summary", s.adminReviewSummary)
 				r.Post("/businesses/{id}/payout-hold", s.adminPayoutHold)
 				r.Post("/businesses/{id}/credits", s.adminCredit)
 				r.Post("/clients/block", s.adminClientBlock)

@@ -18,7 +18,8 @@ func (s *Server) getBusiness(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	slug := chi.URLParam(r, "slug")
 	biz, err := row(ctx, s.pool, `select id, slug, name, tagline, about, category, market, currency, timezone, phone, instagram, tiktok, website,
-		status, verification_status, plan, rating, review_count, tone, highlights, owner_name, review_summary,
+		status, verification_status, plan, rating, review_count, tone, highlights, owner_name,
+		case when review_summary_approved_at is not null then review_summary else '' end as review_summary,
 		(select sm.id from site_media sm where sm.slot='logo' and sm.ref = businesses.slug and sm.active limit 1) as logo_id from businesses where slug=$1 and status<>'suspended'`, slug)
 	if err != nil {
 		if isNoRows(err) {
@@ -308,7 +309,22 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	openLead(ctx, tx, fmt.Sprint(biz["id"]), bookingID, clientID, req.ClientName, req.Source, total)
+	var internal bool
+	if uid := s.customerID(r); uid != nil {
+		if err := tx.QueryRow(ctx, `select customer_business_member($1,$2)`, *uid, biz["id"]).Scan(&internal); err != nil {
+			writeErr(w, 500, "could not verify booking ownership")
+			return
+		}
+	}
+	if internal {
+		req.Source = "internal"
+		if _, err := tx.Exec(ctx, `update bookings set is_internal=true,source='internal' where id=$1`, bookingID); err != nil {
+			writeErr(w, 500, "could not mark internal booking")
+			return
+		}
+	} else {
+		openLead(ctx, tx, fmt.Sprint(biz["id"]), bookingID, clientID, req.ClientName, req.Source, total)
+	}
 	if uid := s.customerID(r); uid != nil {
 		if _, err := tx.Exec(ctx, `update bookings set user_id=$2 where id=$1`, bookingID, *uid); err != nil {
 			writeErr(w, 500, err.Error())
@@ -429,6 +445,7 @@ func (s *Server) joinWaitlist(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/products?category=&q=&seller=
 type orderReq struct {
+	RequestID     string `json:"request_id"` // makes a retry after a lost response answer with the same order
 	CustomerName  string `json:"customer_name"`
 	CustomerPhone string `json:"customer_phone"`
 	CustomerEmail string `json:"customer_email"`
@@ -457,6 +474,19 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Fulfilment != "pickup" && req.Fulfilment != "ship" {
 		writeErr(w, 400, "fulfilment must be pickup or ship")
+		return
+	}
+	// A quote keeps nothing, so it has no request to remember.
+	quoting := strings.HasSuffix(r.URL.Path, "/quote")
+	if quoting {
+		req.RequestID = ""
+	}
+	if req.RequestID != "" && !checkoutRequestID.MatchString(req.RequestID) {
+		writeErr(w, 400, "invalid order request id")
+		return
+	}
+	requestKey, requestBody := s.orderRequestIdentity(r, req)
+	if s.replayOrder(w, r, requestKey, requestBody) {
 		return
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -601,7 +631,7 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		total -= credit
 	}
 	// The cart asks what an order would come to before placing it. Nothing is kept: the transaction is rolled back.
-	if strings.HasSuffix(r.URL.Path, "/quote") {
+	if quoting {
 		writeJSON(w, 200, M{"quote": M{"subtotal_cents": subtotal, "discount_cents": discount, "shipping_cents": shipping, "tax_cents": tax, "gift_cents": gift, "credit_cents": credit, "total_cents": total, "currency": currency}})
 		return
 	}
@@ -614,8 +644,16 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		giftMask = "ending " + c[len(c)-4:] // the full code is as good as money, so it is not stored on the order
 	}
 	var orderID string
-	if err := tx.QueryRow(ctx, `insert into orders (customer_name, customer_phone, status, fulfilment, subtotal_cents, shipping_cents, tax_cents, total_cents, address, promo_code, discount_cents, gift_code, gift_cents)
-		values ($1,$2,$13,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning id`, req.CustomerName, req.CustomerPhone, req.Fulfilment, subtotal, shipping, tax, total, req.Address, promoCode, discount, giftMask, gift, map[bool]string{true: "pending", false: "paid"}[total > 0 && s.payMode(market) == "live"]).Scan(&orderID); err != nil {
+	if err := tx.QueryRow(ctx, `insert into orders (customer_name, customer_phone, status, fulfilment, subtotal_cents, shipping_cents, tax_cents, total_cents, address, promo_code, discount_cents, gift_code, gift_cents, request_key_hash, request_body_hash)
+		values ($1,$2,$13,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,nullif($14,''),nullif($15,'')) returning id`, req.CustomerName, req.CustomerPhone, req.Fulfilment, subtotal, shipping, tax, total, req.Address, promoCode, discount, giftMask, gift, map[bool]string{true: "pending", false: "paid"}[total > 0 && s.payMode(market) == "live"], requestKey, requestBody).Scan(&orderID); err != nil {
+		var pgErr *pgconn.PgError
+		// The same request landed twice at once: the first one placed the order, so answer with it.
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && requestKey != "" {
+			_ = tx.Rollback(ctx)
+			if s.replayOrder(w, r, requestKey, requestBody) {
+				return
+			}
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -687,7 +725,8 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if _, _, err := s.startPayment(ctx, payStart{UserID: payer, CardID: req.CardID, KeepCard: req.SaveCard, Provider: providerFor(market), Purpose: "order", OrderID: orderID, Amount: total, Currency: currency, Email: email, Description: "LogaLuxe shop order"}); err != nil {
-			_, _ = s.pool.Exec(ctx, `update orders set status='cancelled' where id=$1`, orderID)
+			// The request key goes with the cancelled order, so a retry with the same request places a fresh one.
+			_, _ = s.pool.Exec(ctx, `update orders set status='cancelled', request_key_hash=null where id=$1`, orderID)
 			s.unwindOrder(ctx, orderID)
 			writeErr(w, 502, "the payment page could not be opened, so the order was not placed; please try again")
 			return

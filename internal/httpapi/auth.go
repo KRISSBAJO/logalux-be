@@ -21,10 +21,11 @@ import (
 
 // Admin is the signed-in console user for one request.
 type Admin struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
-	Role  string `json:"role"`
+	MustChangePassword bool   `json:"must_change_password"`
+	ID                 string `json:"id"`
+	Email              string `json:"email"`
+	Name               string `json:"name"`
+	Role               string `json:"role"`
 }
 
 type adminKey struct{}
@@ -94,12 +95,16 @@ func (s *Server) requireAdmin(next http.Handler) http.Handler {
 		if s.cfg.AdminToken != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(s.cfg.AdminToken)) == 1 {
 			a = Admin{ID: "", Email: "service-token", Name: "Service token", Role: "super_admin"}
 		} else {
-			err := s.pool.QueryRow(r.Context(), `select a.id::text, a.email, a.name, a.role from admin_sessions s join admin_users a on a.id = s.admin_id
-				where s.token_hash = $1 and s.expires_at > now() and a.active`, hashToken(tok)).Scan(&a.ID, &a.Email, &a.Name, &a.Role)
+			err := s.pool.QueryRow(r.Context(), `select a.id::text, a.email, a.name, a.role, a.must_change_password from admin_sessions s join admin_users a on a.id = s.admin_id
+				where s.token_hash = $1 and s.expires_at > now() and a.active`, hashToken(tok)).Scan(&a.ID, &a.Email, &a.Name, &a.Role, &a.MustChangePassword)
 			if err != nil {
 				writeErr(w, http.StatusUnauthorized, "session expired, sign in again")
 				return
 			}
+		}
+		if a.MustChangePassword && !adminPasswordChangeAllowed(r) {
+			writeErr(w, 403, "change your temporary password before using the admin console")
+			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), adminKey{}, a)))
 	})
@@ -210,10 +215,11 @@ func (s *Server) adminTeam(w http.ResponseWriter, r *http.Request) {
 // POST /v1/admin/team
 func (s *Server) adminTeamCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Email    string `json:"email"`
-		Name     string `json:"name"`
-		Role     string `json:"role"`
-		Password string `json:"password"`
+		Email              string `json:"email"`
+		Name               string `json:"name"`
+		Role               string `json:"role"`
+		Password           string `json:"password"`
+		MustChangePassword bool   `json:"must_change_password"`
 	}
 	if err := readJSON(r, &req); err != nil || req.Email == "" || req.Name == "" {
 		writeErr(w, 400, "email and name are required")
@@ -233,7 +239,7 @@ func (s *Server) adminTeamCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var id string
-	err = s.pool.QueryRow(r.Context(), `insert into admin_users (email, name, role, password_hash) values (lower($1), $2, $3, $4) returning id::text`, req.Email, req.Name, req.Role, string(hash)).Scan(&id)
+	err = s.pool.QueryRow(r.Context(), `insert into admin_users (email, name, role, password_hash, must_change_password) values (lower($1), $2, $3, $4, $5) returning id::text`, req.Email, req.Name, req.Role, string(hash), req.MustChangePassword).Scan(&id)
 	if err != nil {
 		if strings.Contains(err.Error(), "admin_users_email_key") {
 			writeErr(w, 409, "an admin with that email already exists")
@@ -307,4 +313,8 @@ func (s *Server) adminTeamUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "team.update", before["email"].(string), before, M{"role": req.Role, "active": req.Active, "password_changed": req.Password != nil})
 	writeJSON(w, 200, M{"ok": true})
+}
+
+func adminPasswordChangeAllowed(r *http.Request) bool {
+	return (r.Method == http.MethodGet && r.URL.Path == "/v1/admin/me") || (r.Method == http.MethodPost && (r.URL.Path == "/v1/admin/password" || r.URL.Path == "/v1/admin/logout"))
 }

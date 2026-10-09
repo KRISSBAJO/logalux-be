@@ -97,6 +97,11 @@ func openLead(ctx context.Context, tx pgx.Tx, businessID, bookingID string, clie
 	if !leadSources[source] || clientID == nil {
 		return
 	}
+	var internal bool
+	if err := tx.QueryRow(ctx, `select is_internal or customer_business_member(user_id,business_id) from bookings where id=$1`, bookingID).Scan(&internal); err != nil || internal {
+		return
+	}
+
 	// New means: no other booking with this business, ever, and never a lead before.
 	var known bool
 	if err := tx.QueryRow(ctx, `select exists(select 1 from bookings where business_id=$1 and client_id=$2 and id <> $3)
@@ -118,7 +123,7 @@ func settleLead(ctx context.Context, tx pgx.Tx, businessID, currency, bookingID,
 	var id string
 	var base, boost float64
 	var limit *int
-	if err := tx.QueryRow(ctx, `select id::text, base_pct::float8, boost_pct::float8, cap_cents from leads where booking_id=$1 and business_id=$2 and status='pending' for update`, bookingID, businessID).Scan(&id, &base, &boost, &limit); err != nil {
+	if err := tx.QueryRow(ctx, `select id::text, base_pct::float8, boost_pct::float8, cap_cents from leads where booking_id=$1 and business_id=$2 and status='pending' and exists(select 1 from bookings bk where bk.id=$1 and not bk.is_internal and not customer_business_member(bk.user_id,bk.business_id)) for update`, bookingID, businessID).Scan(&id, &base, &boost, &limit); err != nil {
 		return 0
 	}
 	fee := int(math.Round(float64(serviceCents) * (base + boost) / 100))

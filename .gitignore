@@ -7,3 +7,8 @@ tmp/
 .certs/
 docker-compose.override.yml
 tmp-api.log
+
+# Files the media suite makes while it runs
+scripts/e2e/test.png
+scripts/e2e/back.png
+scripts/e2e/fake.jpg

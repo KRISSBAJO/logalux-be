@@ -2,9 +2,11 @@ package httpapi
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -131,6 +133,59 @@ func (s *Server) adminBusinessUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "business.plan", before["name"].(string), before, M{"plan": *req.Plan})
 	writeJSON(w, 200, M{"ok": true})
+}
+
+// POST /v1/admin/businesses/{id}/review-summary  {action: approve | clear | regenerate}
+// The "what people say" summary is written by the AI. A person approves it before it shows on the public page;
+// clearing removes it, and a regenerated one starts unapproved again.
+func (s *Server) adminReviewSummary(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id := chi.URLParam(r, "id")
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := readJSON(r, &req); err != nil || (req.Action != "approve" && req.Action != "clear" && req.Action != "regenerate") {
+		writeErr(w, 400, "action must be approve, clear or regenerate")
+		return
+	}
+	before, err := row(ctx, s.pool, `select name, review_summary, review_summary_approved_at, review_summary_approved_by from businesses where id=$1`, id)
+	if err != nil {
+		writeErr(w, 404, "business not found")
+		return
+	}
+	summary := fmt.Sprint(before["review_summary"])
+	switch req.Action {
+	case "approve":
+		if strings.TrimSpace(summary) == "" {
+			writeErr(w, 400, "there is no summary to approve")
+			return
+		}
+		if _, err := s.pool.Exec(ctx, `update businesses set review_summary_approved_at=now(), review_summary_approved_by=$2 where id=$1`, id, s.actor(r)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	case "clear":
+		// The summary goes, and the worker does not write another until a new review is published.
+		if _, err := s.pool.Exec(ctx, `update businesses set review_summary='', review_summary_at=coalesce(review_summary_at, now()), review_summary_approved_at=null, review_summary_approved_by=null where id=$1`, id); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		summary = ""
+	case "regenerate":
+		var n int
+		_ = s.pool.QueryRow(ctx, `select count(*) from reviews where business_id=$1 and status='published'`, id).Scan(&n)
+		if n < 5 {
+			writeErr(w, 400, "a summary needs at least five published reviews; this business has "+itoa(n))
+			return
+		}
+		if summary, err = s.summariseBusiness(ctx, id, fmt.Sprint(before["name"])); err != nil {
+			writeErr(w, 503, err.Error())
+			return
+		}
+	}
+	s.audit(r, "business.review_summary", fmt.Sprint(before["name"]), before, M{"action": req.Action, "summary": summary})
+	after, _ := row(ctx, s.pool, `select review_summary, review_summary_at, review_summary_approved_at, review_summary_approved_by from businesses where id=$1`, id)
+	writeJSON(w, 200, M{"ok": true, "action": req.Action, "summary": after})
 }
 
 // POST /v1/admin/businesses/{id}/payout-hold  {hold, reason}
@@ -596,6 +651,7 @@ type feeReq struct {
 	TransactionFixedCents int     `json:"transaction_fixed_cents"`
 	TransactionCapCents   *int    `json:"transaction_cap_cents"`
 	NewClientPct          float64 `json:"new_client_pct"`
+	NewClientCapCents     *int    `json:"new_client_cap_cents"`
 	InstantPayoutPct      float64 `json:"instant_payout_pct"`
 	MarketplacePct        float64 `json:"marketplace_pct"`
 	ChargebackCents       int     `json:"chargeback_cents"`
@@ -626,9 +682,13 @@ func (s *Server) adminFeesPropose(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	_, err = s.pool.Exec(r.Context(), `insert into fees (market, plan, transaction_pct, transaction_fixed_cents, transaction_cap_cents, new_client_pct, instant_payout_pct, marketplace_pct, chargeback_cents, plan_price_cents, effective_from, status, proposed_by, approved_by, note)
-		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,null,$13)`,
-		req.Market, req.Plan, req.TransactionPct, req.TransactionFixedCents, req.TransactionCapCents, req.NewClientPct, req.InstantPayoutPct, req.MarketplacePct, req.ChargebackCents, req.PlanPriceCents, req.EffectiveFrom, s.actor(r), req.Note)
+	if req.NewClientCapCents != nil && *req.NewClientCapCents <= 0 {
+		writeErr(w, 400, "new client cap must be positive, or null for no cap")
+		return
+	}
+	_, err = s.pool.Exec(r.Context(), `insert into fees (market, plan, transaction_pct, transaction_fixed_cents, transaction_cap_cents, new_client_pct, instant_payout_pct, marketplace_pct, chargeback_cents, plan_price_cents, effective_from, status, proposed_by, approved_by, note, new_client_cap_cents)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,null,$13,$14)`,
+		req.Market, req.Plan, req.TransactionPct, req.TransactionFixedCents, req.TransactionCapCents, req.NewClientPct, req.InstantPayoutPct, req.MarketplacePct, req.ChargebackCents, req.PlanPriceCents, req.EffectiveFrom, s.actor(r), req.Note, req.NewClientCapCents)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {

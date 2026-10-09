@@ -44,7 +44,7 @@ func (s *Server) mReports(w http.ResponseWriter, r *http.Request) {
 			(select count(*) from sales sa where sa.business_id=$1 and sa.created_at >= $2 and sa.created_at < $3) as sales,
 			(select count(*) from bookings bk where bk.business_id=$1 and bk.starts_at >= $2 and bk.starts_at < $3 and `+liveBooking+`) as bookings,
 			(select count(*) from bookings bk where bk.business_id=$1 and bk.starts_at >= $2 and bk.starts_at < $3 and bk.status = 'no_show') as no_shows,
-			(select count(*) from clients c where c.business_id=$1 and c.created_at >= $2 and c.created_at < $3) as new_clients,
+			(select count(*) from clients c where c.business_id=$1 and c.created_at >= $2 and c.created_at < $3 and not customer_business_member(c.user_id,c.business_id) and not (exists(select 1 from bookings ib where ib.client_id=c.id and ib.is_internal) and not exists(select 1 from bookings eb where eb.client_id=c.id and not eb.is_internal))) as new_clients,
 			(select count(distinct bk.client_id) from bookings bk where bk.business_id=$1 and bk.starts_at >= $2 and bk.starts_at < $3 and bk.status in ('completed','paid') and bk.client_id is not null) as visitors,
 			(select count(distinct bk.client_id) from bookings bk where bk.business_id=$1 and bk.starts_at >= $2 and bk.starts_at < $3 and bk.status in ('completed','paid') and bk.client_id is not null
 			   and exists (select 1 from bookings b2 where b2.client_id = bk.client_id and b2.starts_at > bk.starts_at and b2.status not in ('cancelled_client','cancelled_business','no_show'))) as rebooked`, m.BusinessID, a, b)

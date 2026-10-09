@@ -13,8 +13,8 @@ MPW=$(grep '^MERCHANT_DEMO_PASSWORD=' .env | cut -d= -f2-)
 pass=0; fail=0
 ok() { if [ "$2" = "1" ]; then pass=$((pass+1)); echo "ok   $1"; else fail=$((fail+1)); echo "FAIL $1  ${3:-}"; fi; }
 field() { sed -E "s/.*\"$1\":\"([^\"]+)\".*/\1/"; }
-LX_DB=$(grep -E "^DATABASE_URL=" .env | cut -d= -f2-); [ -n "$LX_DB" ] && LX_DB="$LX_DB&sslrootcert=system"
-sql() { docker exec -i logaluxe-db psql "${LX_DB:-postgresql://logaluxe:logaluxe-dev-only@localhost:5432/logaluxe}" -At; }
+LX_DB=$(grep -E "^DATABASE_URL=" .env | cut -d= -f2- | tr -d '\047\042\015'); [ -n "$LX_DB" ] && LX_DB="$LX_DB&sslrootcert=system"
+sql() { if [ -n "$LX_DB" ]; then docker exec -i logaluxe-db psql "$LX_DB" -At; else docker exec -i logaluxe-db psql -U logaluxe -d logaluxe -At; fi; }
 
 code=$(curl -s -o /tmp/lx-b.html -w '%{http_code}' "$WEB/b/ada")
 ok "the public booking page loads" "$([ "$code" = 200 ] && echo 1)" "$code"
@@ -42,7 +42,8 @@ code=$(curl -s -o /tmp/lx-acc.html -w '%{http_code}' -H "Cookie: lx_user=$CT" "$
 ok "the account page offers a new message to another business" "$([ "$code" = 200 ] && grep -q 'Message to' /tmp/lx-acc.html && echo 1)" "$code"
 
 # clean up
-echo "delete from threads where id='$TH'; delete from users where email='$EMAIL';" | sql >/dev/null
+# A message makes the client known to the business, so that card goes first; then the account itself.
+echo "delete from threads where id='$TH'; delete from clients where user_id in (select id from users where email='$EMAIL'); delete from users where email='$EMAIL';" | sql >/dev/null
 left=$(echo "select count(*) from users where email like 'e2e-client-%@example.test'" | sql)
 ok "the throwaway client is removed" "$([ "$left" = 0 ] && echo 1)" "$left left"
 echo; echo "$pass passed, $fail failed"; [ "$fail" = 0 ]

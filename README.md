@@ -366,3 +366,9 @@ Set `AWS_REGION`, `AWS_S3_BUCKET`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KE
 - Two-step sign-in is TOTP (RFC 6238). A wrong code counts towards the lockout. Recovery codes and reset tokens are stored only as hashes.
 - A service or team member with bookings on record is retired, not deleted.
 - A blocked phone number cannot book. Refunding or cancelling an order puts its stock back.
+
+### Merchant personal profiles and self-review rules
+
+`POST /v1/m/customer-profile` opens a linked personal customer session. A new profile reuses the authenticated merchant's name/email without copying passwords or granting phone/email verification. Linking an existing profile requires its authenticated customer token in `X-Customer-Token`; email alone never links accounts. Customer deletion remains respected.
+
+Bookings made by a linked member at their own business are marked `is_internal` with source `internal`, omitted from marketplace lead fees and public-review eligibility. Review API responses hide review controls; database triggers also reject affiliated business and product reviews. Internal booking status remains visible in the merchant calendar and customer history. Normal bookings and reviews at other businesses remain available. These rules use linked identities and actual merchant memberships, not unverified email/phone matches. They do not detect undisclosed alternate accounts.

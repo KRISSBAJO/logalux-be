@@ -108,6 +108,12 @@ func (s *Server) getProduct(w http.ResponseWriter, r *http.Request) {
 		_ = s.pool.QueryRow(ctx, `select exists(select 1 from orders o join order_items oi on oi.order_id = o.id where o.user_id=$1 and oi.product_id=$2 and o.status in ('paid','ready','shipped','delivered')),
 			exists(select 1 from product_reviews where product_id=$2 and user_id=$1)`, *uid, p["id"]).Scan(&bought, &wrote)
 		switch {
+		case func() bool {
+			var member bool
+			err := s.pool.QueryRow(ctx, `select customer_business_member($1,business_id) from products where id=$2`, *uid, p["id"]).Scan(&member)
+			return err != nil || member
+		}():
+			can = M{"review": false, "why": "Owners and staff cannot review their own products."}
 		case wrote:
 			can = M{"review": false, "why": "You have reviewed this product."}
 		case !bought:
@@ -144,6 +150,15 @@ func (s *Server) authProductReview(w http.ResponseWriter, r *http.Request) {
 	if err := s.pool.QueryRow(ctx, `select p.id::text, exists(select 1 from orders o join order_items oi on oi.order_id = o.id where o.user_id=$2 and oi.product_id = p.id and o.status in ('paid','ready','shipped','delivered'))
 		from products p where p.slug=$1 and p.active`, chi.URLParam(r, "slug"), c.ID).Scan(&id, &bought); err != nil {
 		writeErr(w, 404, "product not found")
+		return
+	}
+	var member bool
+	if err := s.pool.QueryRow(ctx, `select customer_business_member($1,business_id) from products where id=$2`, c.ID, id).Scan(&member); err != nil {
+		writeErr(w, 500, "could not verify review eligibility")
+		return
+	}
+	if member {
+		writeErr(w, 403, "owners and staff cannot review their own products")
 		return
 	}
 	if !bought {

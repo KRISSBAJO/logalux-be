@@ -86,7 +86,7 @@ func (s *Server) adminPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if _, err := s.pool.Exec(r.Context(), `update admin_users set password_hash=$2, password_changed_at=now() where id=$1`, id, string(nh)); err != nil {
+	if _, err := s.pool.Exec(r.Context(), `update admin_users set password_hash=$2, password_changed_at=now(), must_change_password=false where id=$1`, id, string(nh)); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -274,7 +274,7 @@ func (s *Server) adminReset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if _, err := tx.Exec(ctx, `update admin_users set password_hash=$2, password_changed_at=now(), failed_logins=0, locked_until=null where id=$1`, adminID, string(hash)); err != nil {
+	if _, err := tx.Exec(ctx, `update admin_users set password_hash=$2, password_changed_at=now(), must_change_password=false, failed_logins=0, locked_until=null where id=$1`, adminID, string(hash)); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}

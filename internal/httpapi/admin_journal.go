@@ -265,7 +265,10 @@ func (s *Server) adminJournalPublish(w http.ResponseWriter, r *http.Request) {
 			at, status = t, "scheduled"
 		}
 	}
-	if _, err := s.pool.Exec(ctx, `update articles set status=$2, published_at=$3, updated_at=now() where id::text = $1`, id, status, at); err != nil {
+	// "Now" must already be in the past on both clocks: lists ask the database whether an article is live and
+	// the article's own page asks this server, and the two clocks are never exactly together. A scheduled time is kept as given.
+	if err := s.pool.QueryRow(ctx, `update articles set status=$2, published_at = case when $2 = 'published' then least(now(), $3::timestamptz) else $3::timestamptz end, updated_at=now()
+		where id::text = $1 returning published_at`, id, status, at).Scan(&at); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}

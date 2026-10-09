@@ -308,6 +308,15 @@ func (s *Server) authReview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "booking not found")
 		return
 	}
+	var forbidden bool
+	if err := s.pool.QueryRow(ctx, `select is_internal or customer_business_member(user_id,business_id) from bookings where id=$1`, id).Scan(&forbidden); err != nil {
+		writeErr(w, 500, "could not verify review eligibility")
+		return
+	}
+	if forbidden {
+		writeErr(w, 403, "owners and staff cannot review their own business")
+		return
+	}
 	if status != "paid" && status != "completed" {
 		writeErr(w, 409, "you can review a visit once it is finished")
 		return
