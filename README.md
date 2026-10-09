@@ -296,6 +296,47 @@ Five features are off until a super admin switches them on at `/admin/features` 
 
 Suite: `scripts/e2e/features.js` (codes to 555 numbers are read from the API log).
 
+## The Journal
+
+Articles about beauty, read from the home screens and at `/journal`. Table `articles` (migration `0031_journal.sql`); the first ten pieces load once from `internal/db/seed_journal.sql` while the table is empty and `SEED=true`. An article is live when its status is `published` or `scheduled` and `published_at` has passed: a scheduled piece goes up by itself, no worker. `view_count` is incremented by the public read and is the only number shown. `reading_minutes` is the body at 220 words a minute, rounded, never under one. Pictures inside a body are `![alt](media:<id>)`; a pasted `/media/<id>` or `/v1/media/<id>` address is turned back into that form on save, and every id must exist. Categories: `hair, braids, barber, nails, lashes, skin, makeup, spa, business` (for professionals), `guide` (using LogaLuxe). `country` is `''` (both), `US` or `NG`.
+
+Public, no sign-in. Every article in a list carries `{id, slug, title, dek, category, category_label, tags, author_name, author_role, author_media_id, cover_media_id, cover_alt, country, featured, reading_minutes, view_count, published_at}`.
+
+- `GET /v1/journal?category=&country=&q=&tag=&limit=&offset=&featured=1` live articles, featured first then newest; with `q`, best match first (full text over title, summary and body). `country=US` shows pieces for both countries and for the US; without it, everything. `categories` are the chips with counts under the same country, search and tag. `limit` is 12 by default and 500 at most; `limit=500&quiet=1` is the sitemap call.
+  ```json
+  {"articles":[{"id":"9e51959e-…","slug":"knotless-braids-what-to-ask-for","title":"Knotless braids: what to ask for, how long they last, and how to care for them","dek":"Knotless braids lie flat, feel lighter …","category":"braids","category_label":"Braids","tags":["knotless","braids","aftercare","what to ask for"],"author_name":"LogaLuxe editorial","author_role":"Editorial team","author_media_id":null,"cover_media_id":"2a459b2a-…","cover_alt":"A woman with long knotless braids …","country":"","featured":true,"reading_minutes":4,"view_count":6,"published_at":"2026-10-05T09:00:00Z"}],
+   "total":9,"categories":[{"key":"hair","label":"Hair","count":1},{"key":"braids","label":"Braids","count":1},{"key":"guide","label":"Using LogaLuxe","count":2}],"limit":1,"offset":0}
+  ```
+- `GET /v1/journal/home?country=` the home screens in one call: the featured piece (the newest when none is marked), the three newest after it, and the count of live pieces for that country.
+  ```json
+  {"featured":{"slug":"knotless-braids-what-to-ask-for","…":"list fields"},"latest":[{"slug":"gel-or-acrylic-nails-which-to-book","…":"list fields"},{"slug":"what-a-first-visit-costs-in-nashville-and-lagos"},{"slug":"how-to-choose-a-barber-and-describe-a-fade"}],"count":10}
+  ```
+- `GET /v1/journal/{slug}?quiet=1&images=url` one article: the list fields plus `body_md, seo_title, seo_description, related_category, cta_text, status`, with `related` (three others, the same section first) and `next` (the piece published before it; for the oldest, the newest). Counts a view unless `quiet=1`. A draft, scheduled or archived piece is 404 unless the request carries a staff token (`Authorization: Bearer`, the admin's session or `ADMIN_TOKEN`), which previews it without counting. `related_category` defaults to the category when that is a service category, else `null`; `cta_text` defaults by category. `images=url` rewrites `media:<id>` pictures to `/v1/media/<id>` for a reader with no renderer of its own.
+  ```json
+  {"article":{"slug":"silk-press-care","title":"Silk press care: how to keep it sleek and your curls safe","body_md":"A silk press is natural hair washed, blow-dried and flat-iro…","category":"hair","category_label":"Hair","related_category":"hair","cta_text":"Find a hair stylist near you","seo_title":"Silk press care: keep it sleek, keep your curls","seo_description":"What to ask a stylist about heat …","status":"published","reading_minutes":3,"view_count":1,"published_at":"2026-09-09T09:00:00Z","…":"list fields"},
+   "related":[{"slug":"knotless-braids-what-to-ask-for","…":"list fields"},{"slug":"gel-or-acrylic-nails-which-to-book"},{"slug":"what-a-first-visit-costs-in-nashville-and-lagos"}],"next":{"slug":"knotless-braids-what-to-ask-for","…":"list fields"}}
+  ```
+  Unknown slug: `404 {"error":"article not found"}`.
+- `GET /v1/journal/{slug}/professionals?lat=&lng=&place=&scope=` the four professionals to show under the article: it runs `GET /v1/businesses` with `category=<related_category>`, `fill=4`, `limit=4` and the same `lat`, `lng`, `place`, `scope`, `unit`, `radius` and `quiet`, so the answer is exactly that route's shape (`businesses, total, pins, limit, offset, geo`) and the existing cards render it. A guide with no related category answers the best in scope.
+  ```json
+  {"businesses":[{"slug":"nia","name":"Knotless by Nia","category":"braids","tier":"near","from_cents":16000,"services":[…],"…":"the business card fields"},{"slug":"ada","…":"…"},{"slug":"peachtree","tier":"anywhere","…":"…"}],"total":2,"pins":[…],"limit":4,"offset":0,
+   "geo":{"mode":"place","fill":{"near":2,"country":0,"anywhere":1,"short":1},"fill_notice":"Only 2 professionals near Nashville, TN yet. The best elsewhere on LogaLuxe follow.","…":"…"}}
+  ```
+
+Admin, with a staff token. Every role reads; ops and above write; only a super admin publishes. Every change is in the audit log (`journal.create`, `journal.update`, `journal.publish`, `journal.unpublish`, `journal.archive`, `journal.delete`, `journal.draft`).
+
+- `GET /v1/admin/journal?status=&q=` every article with every field (`{articles:[{…list fields, body_md, status, sort, related_category, cta_text, seo_title, seo_description, created_by, created_at, updated_at}]}`), drafts first then most recently changed. `GET /v1/admin/journal/{id}` one, for the editor (`{article}`).
+- `POST /v1/admin/journal` `{title, slug, dek, body_md, cover_media_id, cover_alt, category, tags[], author_name, author_role, author_media_id, country, featured, sort, related_category, cta_text, seo_title, seo_description}` makes a draft; an empty slug is made from the title → `201 {"ok":true,"id":"1c49b601-…","slug":"test-readme-sample"}`. `PUT /v1/admin/journal/{id}` takes the same body and replaces all of it (send every field) → `{ok, id, slug, reading_minutes}`. Validation answers 400 with a sentence: title 8 to 120 characters; summary 20 to 200; slug lowercase letters, digits and hyphens, unique (409 when taken) and fixed once published; category and country from the lists; `related_category` a service category or null; a cover, author picture or body picture must exist. Unknown fields are refused.
+  ```json
+  400 {"error":"the title must be 8 to 120 characters"}
+  ```
+- `POST /v1/admin/journal/{id}/publish` `{at?: "2026-11-01T09:00:00Z"}` now, or scheduled when `at` is in the future → `{"ok":true,"status":"published","published_at":"…"}`. A body under 300 words is refused: `400 {"error":"the article needs at least 300 words to publish; it has 6"}`. Super admin only.
+- `POST /v1/admin/journal/{id}/unpublish` back to a draft (`published_at` cleared) · `POST /v1/admin/journal/{id}/archive` → `{"ok":true,"status":"archived"}` · `DELETE /v1/admin/journal/{id}` drafts only (`409` otherwise; archive instead). Ops and above.
+- `POST /v1/admin/journal/draft` `{topic, category, country, notes}` → `{title, dek, body_md, tags}` written by the model through the same helper as the merchant drafts, in the house voice, with the editor's notes as the only facts it may use. Nothing is saved: it fills the editor and a person reads, edits and publishes it. `503 {"error":"AI drafting is not set up: add OPENAI_API_KEY to the API and restart it"}` without a key. Ops and above.
+- Covers and inline pictures go through `POST /v1/admin/media` with `slot=article` and `ref=<article slug>` (six per article); `GET /v1/site/media?slot=article&ref=<slug>` lists them. The three seeded covers reuse the hero photos' files, so `site_media.storage_key` is no longer unique and a delete only removes the file when no other row still uses it.
+
+Test: `node scripts/e2e/journal.js` (any mode; 82 checks, cleans up after itself) and `go test ./internal/httpapi -run 'TestArticleSlug|TestReadingMinutes|TestMediaImages'`.
+
 ## Email
 
 `MAIL_PROVIDER` is `resend`, `smtp` or `log`. With `log`, or with a provider that is missing its key, messages are written to the API log and not sent, and the console says so. Email is used for password reset links, support replies, gift card codes and bulk messages. Links in emails point at `WEB_URL`. WhatsApp and SMS are not connected: a send on those channels is recorded only.

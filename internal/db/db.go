@@ -29,6 +29,9 @@ var seedOpsSQL string
 //go:embed seed_places.sql
 var seedPlacesSQL string
 
+//go:embed seed_journal.sql
+var seedJournalSQL string
+
 func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
@@ -164,5 +167,23 @@ func SeedPlaces(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("seed places: %w", err)
 	}
 	slog.Info("seeded sample businesses in more cities")
+	return nil
+}
+
+// SeedJournal loads the first ten Journal articles. It runs once, while the
+// articles table is empty, and never touches an article written since. Three
+// covers reuse the landing page's hero photos when those have been uploaded.
+func SeedJournal(ctx context.Context, pool *pgxpool.Pool) error {
+	var n int
+	if err := pool.QueryRow(ctx, `select count(*) from articles`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := pool.Exec(ctx, seedJournalSQL); err != nil {
+		return fmt.Errorf("seed journal: %w", err)
+	}
+	slog.Info("seeded the journal")
 	return nil
 }

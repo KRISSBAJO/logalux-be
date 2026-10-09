@@ -27,6 +27,7 @@ var mediaSlots = map[string]mediaSlot{
 	"business": {"Business photos", 8, "business", 3},
 	"product":  {"Product photos", 6, "product", 4},
 	"logo":     {"Business logos", 1, "business", 5},
+	"article":  {"Journal pictures", 6, "article", 6},
 }
 
 var captionPositions = map[string]bool{"bottom-right": true, "bottom-left": true, "top-right": true, "top-left": true, "none": true}
@@ -59,6 +60,8 @@ func (s *Server) checkRef(ctx context.Context, slot mediaSlot, ref string) strin
 		_ = s.pool.QueryRow(ctx, `select exists(select 1 from businesses where slug=$1)`, ref).Scan(&exists)
 	case "product":
 		_ = s.pool.QueryRow(ctx, `select exists(select 1 from products where slug=$1)`, ref).Scan(&exists)
+	case "article":
+		_ = s.pool.QueryRow(ctx, `select exists(select 1 from articles where slug=$1)`, ref).Scan(&exists)
 	}
 	if !exists {
 		return "no " + slot.Ref + " called " + ref
@@ -264,7 +267,10 @@ func (s *Server) adminMediaDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "image not found")
 		return
 	}
-	if s.store != nil {
+	// A Journal cover can share its file with a hero photo: the file goes only when no other row still uses it.
+	var shared bool
+	_ = s.pool.QueryRow(r.Context(), `select exists(select 1 from site_media where storage_key=$1 and id<>$2)`, key, id).Scan(&shared)
+	if s.store != nil && !shared {
 		if err := s.store.Delete(r.Context(), key); err != nil {
 			writeErr(w, 502, "could not delete the image from storage: "+err.Error())
 			return

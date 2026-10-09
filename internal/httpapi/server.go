@@ -127,6 +127,12 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		r.With(s.limit("support", 10, time.Hour)).Post("/support", s.supportCreate)
 		r.Get("/pages/{slug}", s.sitePage)
 
+		// The Journal: articles about beauty. Public reads see only what is live.
+		r.Get("/journal", s.journalList)
+		r.Get("/journal/home", s.journalHome)
+		r.Get("/journal/{slug}", s.journalRead)
+		r.Get("/journal/{slug}/professionals", s.journalProfessionals)
+
 		// The merchant web: people who run a business.
 		// Payments: the client coming back from the provider's page, and the providers' own calls.
 		r.Post("/payments/{ref}/confirm", s.payConfirm)
@@ -363,6 +369,8 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 			r.Put("/support/{id}", s.adminSupportUpdate)
 			r.Get("/broadcasts", s.adminBroadcasts)
 			r.Get("/pages", s.adminPages)
+			r.Get("/journal", s.adminJournal)
+			r.Get("/journal/{id}", s.adminJournalOne)
 
 			// Ops: decisions that move money or change what the public sees.
 			r.Group(func(r chi.Router) {
@@ -402,6 +410,13 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 				r.Delete("/broadcasts/{id}", s.adminBroadcastDelete)
 				r.Put("/media/{id}", s.adminMediaUpdate)
 				r.Delete("/media/{id}", s.adminMediaDelete)
+				// The Journal: writing and taking down. Publishing is the super admin's, below.
+				r.Post("/journal", s.adminJournalCreate)
+				r.Post("/journal/draft", s.adminJournalDraft)
+				r.Put("/journal/{id}", s.adminJournalUpdate)
+				r.Post("/journal/{id}/unpublish", s.adminJournalUnpublish)
+				r.Post("/journal/{id}/archive", s.adminJournalArchive)
+				r.Delete("/journal/{id}", s.adminJournalDelete)
 			})
 
 			// Super admin: pricing, rollouts, and who has access.
@@ -426,6 +441,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 				r.Put("/settings/referral", s.adminReferralSave)
 				r.Post("/broadcasts/{id}/send", s.adminBroadcastSend)
 				r.Put("/pages/{slug}", s.adminPageUpdate)
+				r.Post("/journal/{id}/publish", s.adminJournalPublish)
 			})
 		})
 	})

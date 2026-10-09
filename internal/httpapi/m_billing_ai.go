@@ -174,6 +174,14 @@ func (s *Server) aiWrite(ctx context.Context, businessID, system, user string, a
 	if err := s.pool.QueryRow(ctx, `insert into ai_usage (business_id, day, n) values ($1, current_date, 1) on conflict (business_id, day) do update set n = ai_usage.n + 1 returning n`, businessID).Scan(&used); err == nil && used > aiDailyLimit {
 		return "", errors.New("you have reached today's limit of " + itoa(aiDailyLimit) + " drafts; it resets tomorrow")
 	}
+	return s.aiAsk(ctx, system, user, asJSON)
+}
+
+// aiAsk is the call itself, with no allowance: the console's Journal drafts use it, behind a staff sign-in.
+func (s *Server) aiAsk(ctx context.Context, system, user string, asJSON bool) (string, error) {
+	if s.cfg.OpenAIKey == "" {
+		return "", errors.New("AI drafting is not set up")
+	}
 	body := M{"model": firstNonEmpty(s.cfg.OpenAIModel, "gpt-4o-mini"), "temperature": 0.5, "messages": []M{{"role": "system", "content": system}, {"role": "user", "content": user}}}
 	if asJSON {
 		body["response_format"] = M{"type": "json_object"}
