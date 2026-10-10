@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/textproto"
 	"regexp"
 	"strings"
 	"time"
@@ -83,7 +85,7 @@ func (m *Mailer) Send(ctx context.Context, to, subject, text string) (string, er
 
 // RelyKit queues delivery; acceptance is not a delivery confirmation.
 func (m *Mailer) relykit(ctx context.Context, to, subject, text string) (string, error) {
-	body, err := json.Marshal(map[string]any{"from": m.cfg.From, "to": []string{to}, "subject": subject, "text": text})
+	body, err := json.Marshal(map[string]any{"from": m.cfg.From, "to": []string{to}, "subject": subject, "text": text, "html": HTML(subject, text)})
 	if err != nil {
 		return "", err
 	}
@@ -119,7 +121,7 @@ func (m *Mailer) relykit(ctx context.Context, to, subject, text string) (string,
 }
 
 func (m *Mailer) resend(ctx context.Context, to, subject, text string) error {
-	body, _ := json.Marshal(map[string]any{"from": m.cfg.From, "to": []string{to}, "subject": subject, "text": text})
+	body, _ := json.Marshal(map[string]any{"from": m.cfg.From, "to": []string{to}, "subject": subject, "text": text, "html": HTML(subject, text)})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.resendURL, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -140,8 +142,10 @@ func (m *Mailer) resend(ctx context.Context, to, subject, text string) error {
 
 func (m *Mailer) smtp(to, subject, text string) error {
 	addr := net.JoinHostPort(m.cfg.SMTPHost, m.cfg.SMTPPort)
-	msg := []byte("From: " + m.cfg.From + "\r\nTo: " + to + "\r\nSubject: " + subject +
-		"\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + strings.ReplaceAll(text, "\n", "\r\n") + "\r\n")
+	msg, err := alternativeMessage(m.cfg.From, to, subject, text)
+	if err != nil {
+		return err
+	}
 	var auth smtp.Auth
 	if m.cfg.SMTPUser != "" {
 		auth = smtp.PlainAuth("", m.cfg.SMTPUser, m.cfg.SMTPPass, m.cfg.SMTPHost)
@@ -184,4 +188,27 @@ func (m *Mailer) smtp(to, subject, text string) error {
 		return err
 	}
 	return c.Quit()
+}
+
+// Send both versions so text-only clients retain every detail and action URL.
+func alternativeMessage(from, to, subject, text string) ([]byte, error) {
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	for _, version := range []struct{ kind, body string }{{"text/plain", text}, {"text/html", HTML(subject, text)}} {
+		h := make(textproto.MIMEHeader)
+		h.Set("Content-Type", version.kind+"; charset=utf-8")
+		h.Set("Content-Transfer-Encoding", "8bit")
+		part, err := w.CreatePart(h)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := io.WriteString(part, version.body); err != nil {
+			return nil, err
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	head := "From: " + from + "\r\nTo: " + to + "\r\nSubject: " + subject + "\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"" + w.Boundary() + "\"\r\n\r\n"
+	return append([]byte(head), body.Bytes()...), nil
 }

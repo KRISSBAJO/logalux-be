@@ -44,21 +44,29 @@ func HTML(subject, text string) string {
 			blocks = append(blocks, block{"list", para})
 		default:
 			blocks = append(blocks, block{"p", para})
+			// Transactional emails often put the action address after a sentence.
+			if !buttonDone {
+				if u := urlRe.FindString(para); u != "" {
+					blocks = append(blocks, block{"link", strings.TrimRight(u, ".,;:)")})
+					buttonDone = true
+				}
+			}
 		}
 	}
 
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>`)
 	b.WriteString(html.EscapeString(subject))
-	b.WriteString(`</title></head><body style="margin:0;padding:0;background:` + cream + `;">`)
+	b.WriteString(`</title><style>@media(max-width:600px){.email-card{padding:24px 20px!important}.email-title{font-size:28px!important}}</style></head><body style="margin:0;padding:0;background:` + cream + `;">`)
+	b.WriteString(`<div style="display:none;max-height:0;overflow:hidden;opacity:0;">` + html.EscapeString(subject) + ` · LogaLuxe</div>`)
 	b.WriteString(`<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:` + cream + `;"><tr><td align="center" style="padding:32px 16px;">`)
 	b.WriteString(`<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;">`)
 	// The mark and the name.
-	b.WriteString(`<tr><td style="padding:0 4px 18px;font-family:Georgia,'Times New Roman',serif;font-size:22px;letter-spacing:.3px;color:` + ink + `;">` +
-		`<span style="display:inline-block;width:14px;height:18px;border:1.5px solid ` + ink + `;border-bottom:0;border-radius:9px 9px 0 0;vertical-align:-3px;margin-right:8px;"></span>LogaLuxe</td></tr>`)
+	b.WriteString(`<tr><td style="padding:24px 28px;background:#120E0D;border-radius:20px 20px 0 0;border-bottom:3px solid ` + gold + `;font-family:Georgia,'Times New Roman',serif;font-size:28px;letter-spacing:.3px;color:` + cream + `;">` +
+		`<span aria-hidden="true" style="color:` + gold + `;margin-right:10px;">✦</span>LogaLuxe<div style="margin-top:8px;font:10px Helvetica,Arial,sans-serif;letter-spacing:2px;color:` + gold + `;">BEAUTY, BOOKED.</div></td></tr>`)
 	// The card.
-	b.WriteString(`<tr><td style="background:#FFFFFF;border:1px solid ` + line + `;border-radius:20px;padding:34px 32px;">`)
-	b.WriteString(`<h1 style="margin:0 0 18px;font-family:'Bodoni Moda',Georgia,'Times New Roman',serif;font-weight:500;font-size:28px;line-height:1.15;color:` + ink + `;">` + html.EscapeString(subject) + `</h1>`)
+	b.WriteString(`<tr><td class="email-card" style="background:#FFFFFF;border:1px solid ` + line + `;border-top:0;border-radius:0 0 20px 20px;padding:32px;">`)
+	b.WriteString(`<h1 class="email-title" style="margin:0 0 24px;font-family:'Bodoni Moda',Georgia,'Times New Roman',serif;font-weight:400;font-size:32px;line-height:1.15;color:` + ink + `;">` + html.EscapeString(subject) + `</h1>`)
 	for _, bl := range blocks {
 		switch bl.kind {
 		case "link":
@@ -71,16 +79,31 @@ func HTML(subject, text string) string {
 			}
 			b.WriteString(`</table>`)
 		default:
+			if code := otpCode(subject, bl.text); code != "" {
+				b.WriteString(`<div style="margin:20px 0;padding:24px 12px;border:1px solid ` + line + `;border-radius:14px;background:` + cream + `;text-align:center;"><div style="font:11px Helvetica,Arial,sans-serif;letter-spacing:1.5px;color:` + muted + `;">YOUR VERIFICATION CODE</div><div style="margin-top:12px;font:700 34px 'Courier New',monospace;letter-spacing:6px;color:` + wine + `;">` + html.EscapeString(code) + `</div></div>`)
+			}
 			b.WriteString(`<p style="margin:0 0 16px;font-family:Helvetica,Arial,sans-serif;font-size:16px;line-height:1.6;color:` + ink + `;">` + strings.ReplaceAll(linkify(bl.text, wine), "\n", "<br>") + `</p>`)
 		}
 	}
 	b.WriteString(`</td></tr>`)
-	b.WriteString(`<tr><td style="padding:18px 4px 0;font-family:Helvetica,Arial,sans-serif;font-size:12px;line-height:1.6;color:` + muted + `;">LogaLuxe · Beauty, booked. This email was sent to you because of an account or a booking on LogaLuxe.</td></tr>`)
+	b.WriteString(`<tr><td style="padding:24px 12px 0;text-align:center;font-family:Helvetica,Arial,sans-serif;font-size:12px;line-height:1.6;color:` + muted + `;">Sent through LogaLuxe · Beauty, booked.<br>Keep verification codes and private booking links to yourself.</td></tr>`)
 	b.WriteString(`</table></td></tr></table></body></html>`)
 	return b.String()
 }
 
 var urlRe = regexp.MustCompile(`https?://[^\s<>"']+`)
+var otpRe = regexp.MustCompile(`\b[0-9]{6}\b`)
+
+func otpCode(subject, paragraph string) string {
+	s := strings.ToLower(subject)
+	if !strings.Contains(s, "code") && !strings.Contains(s, "otp") {
+		return ""
+	}
+	if !strings.Contains(strings.ToLower(paragraph), "code") && strings.TrimSpace(paragraph) != otpRe.FindString(paragraph) {
+		return ""
+	}
+	return otpRe.FindString(paragraph)
+}
 
 // linkify escapes a line of text and turns its addresses into links.
 func linkify(s, color string) string {

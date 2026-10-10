@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -31,6 +32,9 @@ func TestRelyKitQueuesAndRefusesSuppression(t *testing.T) {
 				if body["subject"] != "Hello there" {
 					t.Error("subject was not sanitized")
 				}
+				if body["text"] != "Body" || !strings.Contains(fmtHTML(body["html"]), "LogaLuxe") {
+					t.Error("HTML and plain text must both be submitted")
+				}
 				w.WriteHeader(tt.code)
 				w.Write([]byte(tt.body))
 			}))
@@ -49,3 +53,5 @@ func TestRelyKitQueuesAndRefusesSuppression(t *testing.T) {
 		t.Fatal("missing RelyKit key must log only")
 	}
 }
+
+func fmtHTML(v any) string { s, _ := v.(string); return s }

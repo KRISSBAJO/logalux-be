@@ -4,6 +4,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -139,6 +141,15 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("ADMIN_TOKEN is required in production")
 		}
 		c.AdminToken = "dev-admin-token"
+	}
+	if c.Env == "production" {
+		u, err := url.Parse(c.WebURL)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Hostname() == "localhost" || strings.HasSuffix(u.Hostname(), ".localhost") {
+			return c, fmt.Errorf("WEB_URL must be a public HTTPS website address in production")
+		}
+		if ip := net.ParseIP(u.Hostname()); ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified()) {
+			return c, fmt.Errorf("WEB_URL cannot point at a local network in production")
+		}
 	}
 	return c, nil
 }

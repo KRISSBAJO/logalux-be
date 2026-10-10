@@ -22,6 +22,21 @@ func TestHTMLWrapsTextIntoTheBrandedLayout(t *testing.T) {
 	}
 }
 
+func TestBookingActionAndCodeSafety(t *testing.T) {
+	out := HTML("You are booked at Nia", "Hello Chris,\n\n  Braids\n  Total ₦7000\n\nSee, change or cancel it: https://logaluxe.com/b/nia/book?booking=sample")
+	if !strings.Contains(out, ">See my booking</a>") || !strings.Contains(out, "₦7000") {
+		t.Fatal("booking details or primary action missing")
+	}
+	out = HTML("Your sign-in code", "Your code is 093108. It expires in 10 minutes.\n\n<script>alert(1)</script>")
+	if !strings.Contains(out, "YOUR VERIFICATION CODE") || !strings.Contains(out, "093108") || strings.Contains(out, "<script>") {
+		t.Fatal("code card missing or unsafe content unescaped")
+	}
+	msg, err := alternativeMessage("a@example.com", "b@example.com", "Your sign-in code", "Your code is 093108")
+	if err != nil || !strings.Contains(string(msg), "multipart/alternative") || !strings.Contains(string(msg), "text/plain") || !strings.Contains(string(msg), "text/html") {
+		t.Fatal("SMTP requires both alternatives", err)
+	}
+}
+
 func TestHTMLEscapesAndKeepsLists(t *testing.T) {
 	out := HTML("Your <b>order</b>", "Items:\n\n  2 x Oil & co, from Ada: $20\n  1 x Gel: $12\n\nSee it: https://logaluxe.com/account?tab=orders.")
 	if strings.Contains(out, "<b>order</b>") || !strings.Contains(out, "&lt;b&gt;order&lt;/b&gt;") {
