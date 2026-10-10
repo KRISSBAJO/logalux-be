@@ -22,6 +22,15 @@ func (s *Server) merchantPush(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) savePush(w http.ResponseWriter, r *http.Request, kind, id string) {
 	hash := hashToken(bearer(r))
+	if r.Method == http.MethodGet {
+		var enabled bool
+		if err := s.pool.QueryRow(r.Context(), `select exists(select 1 from push_devices where owner_kind=$1 and owner_id=$2 and session_hash=$3)`, kind, id, hash).Scan(&enabled); err != nil {
+			writeErr(w, 500, "could not check notifications")
+			return
+		}
+		writeJSON(w, 200, M{"enabled": enabled && os.Getenv("PUSH_ENABLED") == "true"})
+		return
+	}
 	if r.Method == http.MethodDelete {
 		if _, err := s.pool.Exec(r.Context(), `delete from push_devices where owner_kind=$1 and owner_id=$2 and session_hash=$3`, kind, id, hash); err != nil {
 			writeErr(w, 500, "could not disable notifications")

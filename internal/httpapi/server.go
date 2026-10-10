@@ -96,6 +96,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireCustomer)
 			r.Post("/auth/push", s.authPush)
+			r.Get("/auth/push", s.authPush)
 			r.Delete("/auth/push", s.authPush)
 			r.Get("/auth/me", s.authMe)
 			r.With(s.limit("handoff-create", 20, 10*time.Minute)).Post("/auth/web-handoff", s.authWebHandoff)
@@ -160,6 +161,7 @@ func New(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 
 			// Everyone on the team: the day's work.
 			r.Post("/push", s.merchantPush)
+			r.Get("/push", s.merchantPush)
 			r.Delete("/push", s.merchantPush)
 			r.Get("/me", s.mMe)
 			r.Post("/customer-profile", s.mCustomer)
