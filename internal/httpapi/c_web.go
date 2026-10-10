@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -120,22 +121,41 @@ func (s *Server) openingsBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	when := r.URL.Query().Get("when")
 	out := M{}
+	// Independent businesses can be checked together. Keep the worker count below
+	// the connection pool size so discovery leaves room for checkout and bookings.
+	var workers sync.WaitGroup
+	var mu sync.Mutex
+	limit := make(chan struct{}, 4)
 	for _, slug := range slugs {
-		id, loc, ok := s.liveBusiness(ctx, slug)
-		if !ok {
-			continue
+		select {
+		case limit <- struct{}{}:
+		case <-ctx.Done():
+			workers.Wait()
+			return
 		}
-		svc, name := s.firstService(ctx, id, strings.TrimSpace(r.URL.Query().Get("q")))
-		if svc == "" {
-			continue
-		}
-		slots := s.nextOpenings(ctx, id, loc, []string{svc}, "any", 3, 2)
-		entry := M{"service_id": svc, "service": name, "slots": slots}
-		if days := windowDays(when, time.Now().In(loc)); days != nil {
-			entry["in_window"] = s.freeInWindow(ctx, id, loc, svc, slots, days)
-		}
-		out[slug] = entry
+		workers.Add(1)
+		go func(slug string) {
+			defer workers.Done()
+			defer func() { <-limit }()
+			id, loc, ok := s.liveBusiness(ctx, slug)
+			if !ok {
+				return
+			}
+			svc, name := s.firstService(ctx, id, strings.TrimSpace(r.URL.Query().Get("q")))
+			if svc == "" {
+				return
+			}
+			slots := s.nextOpenings(ctx, id, loc, []string{svc}, "any", 3, 2)
+			entry := M{"service_id": svc, "service": name, "slots": slots}
+			if days := windowDays(when, time.Now().In(loc)); days != nil {
+				entry["in_window"] = s.freeInWindow(ctx, id, loc, svc, slots, days)
+			}
+			mu.Lock()
+			out[slug] = entry
+			mu.Unlock()
+		}(slug)
 	}
+	workers.Wait()
 	writeJSON(w, 200, M{"openings": out, "when": when})
 }
 
