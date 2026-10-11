@@ -37,7 +37,12 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.MaxConns = 10
+	// Leave room for a second instance during deploys and local development
+	// against the same hosted database. Release unused connections promptly.
+	cfg.MaxConns = 4
+	cfg.MinConns = 0
+	cfg.MaxConnIdleTime = 30 * time.Second
+	cfg.HealthCheckPeriod = 15 * time.Second
 	var pool *pgxpool.Pool
 	// Postgres in Compose can take a few seconds to accept connections.
 	for attempt := 1; attempt <= 20; attempt++ {
