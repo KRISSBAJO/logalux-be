@@ -489,6 +489,7 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	if s.replayOrder(w, r, requestKey, requestBody) {
 		return
 	}
+	buyer := s.customerID(r)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -614,7 +615,6 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 	total -= gift
 	// Referral credit is spent before any card is asked for.
 	credit := 0
-	buyer := s.customerID(r)
 	if buyer != nil && total > 0 { // only matching-currency credit can be spent
 		// Lock the owner row so two checkouts cannot spend the same balance.
 		if _, err := tx.Exec(ctx, `select 1 from users where id=$1 for update`, *buyer); err != nil {
@@ -635,9 +635,16 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, M{"quote": M{"subtotal_cents": subtotal, "discount_cents": discount, "shipping_cents": shipping, "tax_cents": tax, "gift_cents": gift, "credit_cents": credit, "total_cents": total, "currency": currency}})
 		return
 	}
-	if credit > 0 && !s.customerSecurityOK(r) {
-		writeJSON(w,403,M{"error":"confirm your account before spending store credit","need":"security_verification"})
-		return
+	if credit > 0 {
+		var verified bool
+		if err := tx.QueryRow(ctx, `select exists(select 1 from user_sessions where token_hash=$1 and expires_at>now() and security_verified_until>now())`, hashToken(bearer(r))).Scan(&verified); err != nil {
+			writeErr(w, 503, "could not verify store-credit spending; please retry")
+			return
+		}
+		if !verified {
+			writeJSON(w, 403, M{"error": "confirm your account before spending store credit", "need": "security_verification"})
+			return
+		}
 	}
 	promoCode, giftMask := "", ""
 	if promoID != "" {
