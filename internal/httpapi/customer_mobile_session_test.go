@@ -117,6 +117,31 @@ func TestSecurityRotatingMobileSessions(t *testing.T) {
 	}
 }
 
+func TestSecurityMobileRefreshWithShopHandoff(t *testing.T) {
+	s := securityServer(t)
+	_, _, _, user, _ := securityFixture(t, s)
+	token, err := s.startUserSession(context.Background(), user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := mobileAnswer(t, mobileCall(t, s, s.authMobileSession, token, user, `{}`))
+	handoff := mobileAnswer(t, mobileCall(t, s, s.authWebHandoff, token, user, `{"path":"/cart"}`))
+	code := strings.Split(handoff["url"].(string), "#")[1]
+	rotated := mobileAnswer(t, mobileCall(t, s, s.authMobileRefresh, "", "", `{"refresh_token":"`+initial["refresh_token"].(string)+`"}`))
+	var source string
+	if err := s.pool.QueryRow(context.Background(), `select source_session_hash from customer_web_handoffs where code_hash=$1`, hashToken(code)).Scan(&source); err != nil {
+		t.Fatal(err)
+	}
+	if source != hashToken(rotated["token"].(string)) {
+		t.Fatal("shop handoff lost its owning device session")
+	}
+	mobileAnswer(t, mobileCall(t, s, s.authMobileLogout, "", "", `{"refresh_token":"`+rotated["refresh_token"].(string)+`"}`))
+	var count int
+	if err := s.pool.QueryRow(context.Background(), `select count(*) from customer_web_handoffs where code_hash=$1`, hashToken(code)).Scan(&count); err != nil || count != 0 {
+		t.Fatal("logout did not revoke shop handoff")
+	}
+}
+
 func TestSecurityMobileRefreshResponseRecovery(t *testing.T) {
 	s := securityServer(t)
 	_, _, _, user, _ := securityFixture(t, s)
