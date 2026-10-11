@@ -174,6 +174,11 @@ func TestSecurityNairaCheckoutCreditAndGift(t *testing.T) {
 		t.Fatal("quote spent real credit")
 	}
 	w = accountRequest(c, "POST", "/v1/orders", body, s.createOrder)
+	if w.Code != 403 || creditBalanceIn(context.Background(), s.pool, user, "NGN") != 800000 {
+		t.Fatalf("unverified wallet checkout was not blocked: %d", w.Code)
+	}
+	securityExec(t, s, `update user_sessions set security_verified_until=now()+interval '5 minutes' where token_hash=$1`, hashToken("account-test"))
+	w = accountRequest(c, "POST", "/v1/orders", body, s.createOrder)
 	if w.Code != 201 {
 		t.Fatalf("naira order: %d %s", w.Code, w.Body.String())
 	}

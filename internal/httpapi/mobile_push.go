@@ -91,7 +91,7 @@ func (s *Server) runMobilePush(ctx context.Context) {
 		return
 	}
 	_, err := s.pool.Exec(ctx, `delete from push_devices d where
- (d.owner_kind='customer' and not exists(select 1 from user_sessions ss join users u on u.id=ss.user_id where ss.token_hash=d.session_hash and ss.user_id=d.owner_id and ss.expires_at>now() and u.deleted_at is null)) or
+ (d.owner_kind='customer' and not exists(select 1 from user_sessions ss join users u on u.id=ss.user_id where ss.token_hash=d.session_hash and ss.user_id=d.owner_id and (ss.expires_at>now() or exists(select 1 from customer_refresh_tokens rt where rt.session_id=ss.id and rt.used_at is null and least(rt.idle_expires_at,rt.absolute_expires_at)>now())) and u.deleted_at is null)) or
  (d.owner_kind='merchant' and not exists(select 1 from merchant_sessions ss where ss.token_hash=d.session_hash and ss.merchant_id=d.owner_id and ss.expires_at>now()))`)
 	if err != nil {
 		return

@@ -24,7 +24,7 @@ func customerPage(r *http.Request, key string) int {
 // GET /auth/sessions: opaque session IDs only; never expose bearer-token hashes.
 func (s *Server) authSessions(w http.ResponseWriter, r *http.Request) {
 	out, err := rows(r.Context(), s.pool, `select id, device_name, created_at, last_seen_at, expires_at, token_hash=$2 as current
- from user_sessions where user_id=$1 and expires_at>now() order by last_seen_at desc, id`, currentCustomer(r).ID, hashToken(bearer(r)))
+ from user_sessions s where user_id=$1 and (expires_at>now() or exists(select 1 from customer_refresh_tokens rt where rt.session_id=s.id and rt.used_at is null and least(rt.idle_expires_at,rt.absolute_expires_at)>now())) order by last_seen_at desc, id`, currentCustomer(r).ID, hashToken(bearer(r)))
 	if err != nil {
 		writeErr(w, 500, "could not load your signed-in devices")
 		return

@@ -635,6 +635,10 @@ func (s *Server) createOrder(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, M{"quote": M{"subtotal_cents": subtotal, "discount_cents": discount, "shipping_cents": shipping, "tax_cents": tax, "gift_cents": gift, "credit_cents": credit, "total_cents": total, "currency": currency}})
 		return
 	}
+	if credit > 0 && !s.customerSecurityOK(r) {
+		writeJSON(w,403,M{"error":"confirm your account before spending store credit","need":"security_verification"})
+		return
+	}
 	promoCode, giftMask := "", ""
 	if promoID != "" {
 		promoCode = strings.ToUpper(strings.TrimSpace(req.PromoCode))

@@ -2,11 +2,13 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/bcrypt"
 
 	"logaluxe/api/internal/mail"
@@ -47,14 +49,19 @@ func bearer(r *http.Request) string {
 // customerFrom returns the signed-in customer, or false. It never errors: a
 // guest is a normal visitor.
 func (s *Server) customerFrom(ctx context.Context, token string) (Customer, bool) {
+	c, err := s.lookupCustomer(ctx, token)
+	return c, err == nil
+}
+
+func (s *Server) lookupCustomer(ctx context.Context, token string) (Customer, error) {
 	var c Customer
 	if token == "" {
-		return c, false
+		return c, pgx.ErrNoRows
 	}
 	err := s.pool.QueryRow(ctx, `select u.id::text, coalesce(u.email,''), u.first_name, u.last_name, coalesce(u.phone,''), u.email_verified_at is not null, u.phone_verified_at is not null, u.preferred_channel, u.password_hash is not null
 		from user_sessions s join users u on u.id = s.user_id where s.token_hash = $1 and s.expires_at > now() and u.deleted_at is null`, hashToken(token)).
 		Scan(&c.ID, &c.Email, &c.FirstName, &c.LastName, &c.Phone, &c.EmailVerified, &c.PhoneVerified, &c.Channel, &c.HasPassword)
-	return c, err == nil
+	return c, err
 }
 
 // customerID is for routes a guest may also use, such as booking.
@@ -67,8 +74,12 @@ func (s *Server) customerID(r *http.Request) *string {
 
 func (s *Server) requireCustomer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, ok := s.customerFrom(r.Context(), bearer(r))
-		if !ok {
+		c, err := s.lookupCustomer(r.Context(), bearer(r))
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			writeErr(w, 503, "LogaLuxe is temporarily unavailable; your sign-in has been kept")
+			return
+		}
+		if err != nil {
 			writeErr(w, http.StatusUnauthorized, "sign in to continue")
 			return
 		}
@@ -90,7 +101,7 @@ func (s *Server) startUserSession(ctx context.Context, userID string) (string, e
 	if _, err := s.pool.Exec(ctx, `insert into user_sessions (token_hash, user_id, expires_at) values ($1,$2,$3)`, hashToken(tok), userID, time.Now().Add(userSessionTTL)); err != nil {
 		return "", err
 	}
-	_, _ = s.pool.Exec(ctx, `delete from user_sessions where expires_at < now()`)
+	_, _ = s.pool.Exec(ctx, `delete from user_sessions s where expires_at < now() and not exists(select 1 from customer_refresh_tokens t where t.session_id=s.id and t.used_at is null and least(t.idle_expires_at,t.absolute_expires_at)>now())`)
 	return tok, nil
 }
 
@@ -336,7 +347,17 @@ func (s *Server) authUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := currentCustomer(r)
-	if _, err := s.pool.Exec(r.Context(), `update users set first_name=$2, last_name=$3, phone=nullif($4,''),
+	if (phone != c.Phone || (strings.TrimSpace(req.Email) != "" && c.Email == "")) && !s.customerSecurityOK(r) {
+		writeJSON(w, 403, M{"error": "confirm your account before changing your contact details", "need": "security_verification"})
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		writeErr(w, 503, "could not save your details")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if _, err := tx.Exec(r.Context(), `update users set first_name=$2, last_name=$3, phone=nullif($4,''),
 		phone_verified_at = case when coalesce(phone,'') = $4 then phone_verified_at end where id=$1`, c.ID, req.FirstName, req.LastName, phone); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -347,15 +368,38 @@ func (s *Server) authUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var taken bool
-		_ = s.pool.QueryRow(r.Context(), `select exists(select 1 from users where lower(email) = $1 and id <> $2)`, email, c.ID).Scan(&taken)
+		if err := tx.QueryRow(r.Context(), `select exists(select 1 from users where lower(email) = $1 and id <> $2)`, email, c.ID).Scan(&taken); err != nil {
+			writeErr(w, 503, "could not verify the email address")
+			return
+		}
 		if taken {
 			writeErr(w, 409, "that email already has an account")
 			return
 		}
-		if _, err := s.pool.Exec(r.Context(), `update users set email=$2, email_verified_at=null where id=$1 and email is null`, c.ID, email); err != nil {
+		if _, err := tx.Exec(r.Context(), `update users set email=$2, email_verified_at=null where id=$1 and email is null`, c.ID, email); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
+	}
+	if phone != c.Phone || (strings.TrimSpace(req.Email) != "" && c.Email == "") {
+		if _, err = tx.Exec(r.Context(), `delete from user_sessions where user_id=$1 and token_hash<>$2`, c.ID, hashToken(bearer(r))); err != nil {
+			writeErr(w, 503, "could not secure your updated account")
+			return
+		}
+		if _, err = tx.Exec(r.Context(), `delete from customer_refresh_tokens where session_id in(select id from user_sessions where user_id=$1)`, c.ID); err != nil {
+			writeErr(w, 503, "could not secure your updated account")
+			return
+		}
+		if _, err = tx.Exec(r.Context(), `update user_sessions set security_verified_until=null where user_id=$1`, c.ID); err != nil {
+			writeErr(w, 503, "could not secure your updated account")
+			return
+		}
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		writeErr(w, 503, "could not save your details")
+		return
+	}
+	if email := strings.ToLower(strings.TrimSpace(req.Email)); email != "" && c.Email == "" {
 		s.sendVerifyEmail(r.Context(), c.ID, email, req.FirstName)
 	}
 	writeJSON(w, 200, M{"ok": true})
@@ -388,6 +432,9 @@ func (s *Server) authPassword(w http.ResponseWriter, r *http.Request) {
 		// A password signs in with an email, so the account needs one first.
 		writeErr(w, 400, "add an email address to your details first; the password goes with it")
 		return
+	case hash == nil && !s.customerSecurityOK(r):
+		writeErr(w, 403, "confirm your account before setting a password")
+		return
 	case hash != nil && bcrypt.CompareHashAndPassword([]byte(*hash), []byte(req.Current)) != nil:
 		writeErr(w, 403, "the current password is wrong")
 		return
@@ -397,8 +444,25 @@ func (s *Server) authPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	_, _ = s.pool.Exec(ctx, `update users set password_hash=$2 where id=$1`, id, string(nh))
-	_, _ = s.pool.Exec(ctx, `delete from user_sessions where user_id=$1 and token_hash <> $2`, id, hashToken(bearer(r)))
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		writeErr(w, 503, "could not change your password")
+		return
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `update users set password_hash=$2 where id=$1`, id, string(nh)); err == nil {
+		_, err = tx.Exec(ctx, `delete from user_sessions where user_id=$1 and token_hash <> $2`, id, hashToken(bearer(r)))
+	}
+	if err == nil {
+		_, err = tx.Exec(ctx, `delete from customer_refresh_tokens where session_id in(select id from user_sessions where user_id=$1)`, id)
+	}
+	if err == nil {
+		_, err = tx.Exec(ctx, `update user_sessions set security_verified_until=null where user_id=$1`, id)
+	}
+	if err != nil || tx.Commit(ctx) != nil {
+		writeErr(w, 503, "could not change your password")
+		return
+	}
 	writeJSON(w, 200, M{"ok": true})
 }
 
